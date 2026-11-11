@@ -24,6 +24,22 @@ Rendering uses high-quality SMAA edge smoothing and native Game-view resolution 
 
 Unity captures a clean 960x540 chase-camera JPEG (without HUD), sends it with the original user command and last action result to `POST http://127.0.0.1:8000/step`, receives one JSON action, executes it, then observes again. Game coordinates and target positions are not sent to the VLM. No hidden navigation planner moves the dog to the ball.
 
+Before each capture, the chase camera snaps to the current heading. Plain fetch commands use an explicit state machine owned by Unity:
+
+| State sent with the screenshot | Immediate goal | Action source |
+| --- | --- | --- |
+| `approach_ball` | Navigate toward the red ball; ignore the owner | VLM |
+| `pick_up` | Ball is within 2 m and low enough to pick up | Fetch controller; no model call |
+| `approach_owner` | Navigate toward the blue person; ignore the carried ball | VLM |
+| `drop` | Owner is within 3 m; release the ball | Fetch controller; no model call |
+| `complete` | Delivery succeeded; finish | Fetch controller; no model call |
+
+Each request contains the original user command, screenshot, current state, carrying flag, and execution feedback. Each approach prompt gives only that state's navigation goal, with no old visual claims or ball-approach history replayed on the return leg. The VLM can choose only movement, turning, or waiting in approach states; it cannot finish early or pick/drop at the wrong stage. The HUD displays the state and labels automatic interactions as **Fetch controller**.
+
+Both approach states allow 1.0-1.5 meter moves when far and aligned, shortening to 0.3-0.6 meters nearby. Unity checks proximity during movement and stops as soon as the interaction range is reached, avoiding an overshoot followed by more turning. Automatic fetch pickup does not require extra facing adjustment once nearby; manual pickup retains its facing check. Coordinates are used locally for proximity checks and are not sent to the model. The model describes current visual evidence before choosing its action.
+
+Standalone actions and compound choreography such as "Dance then fetch" retain the general `command` loop. That loop keeps a short history of actions and execution feedback without replaying old model explanations.
+
 The local Python bridge calls an online vision model through OpenAI's Responses API with an image and a constrained JSON schema. It keeps action history per task. By default, a missing API key, API rejection, timeout or invalid model response switches that task to a clearly labelled placeholder demo. Unity bounds action lengths, enforces pickup distance, handles collisions and stops after 80 decisions. Stop cancels local movement; an already-running model inference may finish in the server but its result is discarded.
 
 ## Start the server
@@ -38,6 +54,8 @@ python server.py --model gpt-6.1-terra
 Set `OPENAI_API_KEY` in the server process environment before starting. Never put it in a Unity script or paste it into chat. API billing/access must be configured independently of the Unity project. ChatGPT Plus does not provide an API key or the Pro/Business API-credit benefit. The model is configurable with `--model` or `VLM_MODEL`. The default is a vision-capable API model, not a local download. `GET /health` confirms the bridge and whether a key is configured, not API credits or model availability.
 
 An optional `--provider ollama --model YOUR_VISION_MODEL` mode is also available, but no local model is needed for the default online mode. `--api-url` selects an alternative Responses-compatible API base URL.
+
+For local Qwen3-VL, keep Ollama running and use `python Server/server.py --provider ollama --model qwen3-vl:4b-instruct --api-url http://127.0.0.1:11434 --mode live --api-timeout 120` from the project root. `live` makes model failures visible instead of running the scripted fallback. Restart the Python bridge after changing its code.
 
 Try: "Sit." Then "Dance, then find the red ball and bring it back to the person in blue."
 
@@ -56,7 +74,9 @@ The placeholder recognizes simple actions such as sit, stand, dance, roll, forwa
 - `Server/server.py`: `SYSTEM` defines what the model can do; `VisionBridge.step()` sends the screenshot to the online model and validates its JSON output.
 - `Assets/GoodBoy/Scripts/GoodBoyGame.cs`: `AILoop()` sends observations and receives responses; `Execute()` maps the JSON action to actual Unity movement/animations. The HUD distinguishes real VLM responses from placeholder demos.
 - `Assets/GoodBoy/Scripts/FetchBall.cs`: handles flight, stationary landing and mouth attachment. Carrying disables interpolation and collision physics; dropping restores flight physics.
-- `Server/trace/latest-observation.jpg`: latest successfully processed camera input; `latest-action.json`: corresponding command, feedback and validated action; `decisions.jsonl`: history. These are written after successful model replies. Run with `--trace-dir ""` to disable saving them. API keys are never written to these files.
+- `Server/trace/latest-observation.jpg`: exact latest JPEG received from Unity, saved **before** asking the model, including when the model later fails. Open this to see the screenshot the model receives.
+- `Server/trace/observations/`: each received screenshot is retained under a timestamped unique filename, with a matching `.json` containing session, step, task state, carrying flag, provider/model, prompts, and response/error. `model_response` is Qwen's exact response text before validation; `action` is the validated/clamped action sent to Unity, including its reason. Controller interactions have `source: "state_machine"` and no model response, because no inference was needed. The raw response is retained even if its JSON is invalid. The server prints the image path. Files accumulate until you remove them.
+- `Server/trace/latest-action.json`: metadata for the latest observation, with `status` of `pending`, `completed`, or `error`. `image_file` identifies its archived screenshot; an error never retains an older action. `decisions.jsonl` records completed/failed requests. Traces include placeholder responses too. Run with `--trace-dir ""` to disable saving; the trace directory is Git-ignored and API keys are not logged.
 
 Example server response: `{"action":"move_forward","amount":0.6,"reason":"Approach the red ball"}`. Unity moves the dog 0.6 meters, reports whether it was blocked, captures a new image, and asks for the next action.
 
@@ -66,4 +86,4 @@ The bridge and protocol can be tested without a real model using `python -m unit
 
 The `Good Boy > Create Fetch Scene` menu creates a dedicated scene if absent and adds it to the build list. Existing scenes are preserved. `GoodBoySetup.CreateScene` is also callable in batch mode. `GoodBoySetup.Verify` tests movement, pickup/delivery ranges, carry alignment through animations, stationary landing, and rendering. It writes `Verification/result.json` and screenshots.
 
-With this project open in Unity, run `python Server/verify_unity.py --project "D:\Apps\Unity\Who's a good boy" --running-editor` to additionally test both HTTP hops using a local mock vision provider. Add `--placeholder-fallback` to simulate an API outage and verify the fallback sequence. Tests also inject keyboard input to check immediate WASD, typing isolation and Enter restoring movement. They make no paid calls. A passing mock test verifies the integration, **not** the real model's visual navigation ability; that still requires a funded API key.
+With this project open in Unity, run `python Server/verify_unity.py --project "D:\bajra\IISc\Assignment\IUI\A2\Unity-UI-Ass2" --running-editor` to additionally test both HTTP hops using a local mock vision provider. Add `--placeholder-fallback` to simulate an API outage and verify the fallback sequence. Tests also inject keyboard input to check immediate WASD, typing isolation and Enter restoring movement. They make no paid calls. A passing mock test verifies the integration, **not** the real model's visual navigation ability; evaluate that with a working local or online vision model.

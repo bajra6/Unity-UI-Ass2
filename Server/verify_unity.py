@@ -30,6 +30,12 @@ def main():
                 self.send_error(400, "Expected a real camera JPEG")
                 return
             observations.append(len(image))
+            if request['text']['format']['name'] == 'dog_plan':
+                names = ['get_ball', 'deliver_ball'] if args.placeholder_fallback else ['dance', 'move_forward', 'turn_right']
+                plan = {'reason': 'Integration test plan', 'steps': [{'action': name, 'amount': 30 if name == 'turn_right' else .6 if name == 'move_forward' else 1} for name in names]}
+                body = json.dumps({'status': 'completed', 'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(plan)}]}]}).encode()
+                self.send_response(200); self.end_headers(); self.wfile.write(body)
+                return
             if args.placeholder_fallback:
                 self.send_error(503,"Simulated API outage")
                 return
@@ -73,10 +79,10 @@ def main():
                 os.path.join(args.project, "verification-log.txt"),
             ], env=environment, timeout=180, creationflags=subprocess.CREATE_NO_WINDOW)
             if result.returncode:raise SystemExit(result.returncode)
-        expected=1 if args.placeholder_fallback else 4
+        expected=2 if args.placeholder_fallback else 1
         if len(observations) != expected:
             raise SystemExit(f"Expected {expected} upstream requests, got {len(observations)}")
-        print("UNITY_INTEGRATION_OK:", "API failure -> labelled placeholder movement -> finish" if args.placeholder_fallback else "four real JPEG observations -> JSON movement/actions", "No external API calls.")
+        print("UNITY_INTEGRATION_OK:", "API failure -> labelled placeholder movement -> finish" if args.placeholder_fallback else "real JPEG -> model plan -> ordered dance/move/turn/finish", "No external API calls.")
         print("JPEG sizes:", observations)
     finally:
         for server in (local, upstream):

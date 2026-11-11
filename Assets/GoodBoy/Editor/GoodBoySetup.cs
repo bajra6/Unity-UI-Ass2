@@ -205,10 +205,10 @@ public class GoodBoyVerification : MonoBehaviour
         {
             if(url.Length>0)game.serverUrl=url;
             Vector3 beforeAI=dog.position;
-            game.BeginAI();
             bool placeholder=SessionState.GetBool("GoodBoyVerifyPlaceholder",false) || Environment.GetEnvironmentVariable("GOODBOY_VERIFY_PLACEHOLDER")=="1";
+            game.BeginCommand(placeholder ? "Find the ball" : "Dance, move forward, turn right, then finish.");
             float deadline = Time.realtimeSinceStartup + 35;
-            string finishedPrefix=placeholder ? "Placeholder demo finished" : "Model marked";
+            string finishedPrefix=placeholder ? "Placeholder demo finished" : "Task complete";
             while ((game.DecisionCount < 4 || !game.LastResult.StartsWith(finishedPrefix)) && Time.realtimeSinceStartup < deadline) yield return null;
             if (game.DecisionCount != 4 || !game.LastResult.StartsWith(finishedPrefix) || Vector3.Distance(beforeAI,dog.position)<.45f)
             { Fail(8,"Unity HTTP movement/action loop failed: " + game.LastResult); yield break; }

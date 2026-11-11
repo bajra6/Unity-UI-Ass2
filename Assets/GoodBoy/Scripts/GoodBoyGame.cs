@@ -28,7 +28,12 @@ public class GoodBoyGame : MonoBehaviour
     Camera dogCamera;
     Material brown, cream, black, red, blue, white, grey, mint;
     bool busy, aiRunning, holding, seated;
+    bool fetchTask, fetchDelivered;
+    readonly Queue<DogPlanStep> remainingPlan = new Queue<DogPlanStep>();
+    DogPlanStep activeStep;
+    public string TaskState { get; private set; } = "idle";
     string command = "Find the red ball, pick it up, and bring it back to the person in blue.";
+    string activeCommand = "";
     string status = "Ready. Throw the ball, then give your dog a command.";
     string lastResult = "Ready";
     string lastAction = "None";
@@ -197,7 +202,7 @@ public class GoodBoyGame : MonoBehaviour
             float scale = Mathf.Min(Screen.width / 1280f, Screen.height / 720f);
             Vector2 point = Mouse.current.position.ReadValue();
             point = new Vector2(point.x / scale, (Screen.height-point.y) / scale);
-            SetCommandEditing(!busy && !aiRunning && CommandRect(Screen.width/scale, Screen.height/scale).Contains(point));
+            SetCommandEditing(CommandRect(Screen.width/scale, Screen.height/scale).Contains(point));
         }
         if (Mouse.current != null && Mouse.current.rightButton.isPressed && !aiRunning)
         {
@@ -275,6 +280,8 @@ public class GoodBoyGame : MonoBehaviour
     {
         if (busy || aiRunning) return;
         holding = false;
+        fetchDelivered = false;
+        TaskState = "idle";
         target.y = FetchBall.Radius;
         Vector3 origin = owner.position + Vector3.up * 1.4f + Vector3.forward * .8f;
         float flightTime = .9f;
@@ -289,6 +296,10 @@ public class GoodBoyGame : MonoBehaviour
         SetCommandEditing(false);
         generation++;
         aiRunning = false;
+        fetchTask = false;
+        remainingPlan.Clear();
+        activeStep = null;
+        TaskState = "idle";
         busy = false;
         StopAllCoroutines();
         checkingHealth = false;
@@ -325,13 +336,17 @@ public class GoodBoyGame : MonoBehaviour
             float remaining = distance;
             while (remaining > .00001f)
             {
+                // Do not walk past a target while completing a long VLM move.
+                if (fetchTask && aiRunning && InteractionReady()) break;
                 float step = Mathf.Min(1.5f * Time.deltaTime, remaining);
                 controller.Move(dog.forward * (action == "move_forward" ? 1 : -1) * step);
                 AnimateWalk(Time.time);
                 remaining -= step;
                 yield return null;
             }
-            lastResult = Vector3.Distance(start, dog.position) < distance * .6f ? "Movement blocked by a collision." : "Movement completed.";
+            lastResult = fetchTask && aiRunning && InteractionReady()
+                ? (holding ? "Reached delivery range." : "Reached pickup range.")
+                : Vector3.Distance(start, dog.position) < distance * .6f ? "Movement blocked by a collision." : "Movement completed.";
         }
         else if (action == "turn_left" || action == "turn_right")
         {
@@ -339,6 +354,7 @@ public class GoodBoyGame : MonoBehaviour
             float duration = degrees / 100;
             for (float t = 0; t < duration;)
             {
+                if (fetchTask && aiRunning && InteractionReady()) break;
                 float dt = Mathf.Min(Time.deltaTime, duration - t);
                 dog.Rotate(0, (action == "turn_left" ? -1 : 1) * 100 * dt, 0);
                 t += dt;
@@ -350,7 +366,7 @@ public class GoodBoyGame : MonoBehaviour
         {
             Vector3 flat = ball.position - dog.position; flat.y = 0;
             bool inFront = flat.sqrMagnitude < .01f || Vector3.Dot(dog.forward, flat.normalized) > -.15f;
-            if (!holding && flat.magnitude <= pickupRange && ball.position.y < 1.5f && inFront)
+            if (!holding && flat.magnitude <= pickupRange && ball.position.y < 1.5f && (inFront || (fetchTask && aiRunning)))
             {
                 fetchBall.Carry(mouth);
                 holding = true;
@@ -365,6 +381,7 @@ public class GoodBoyGame : MonoBehaviour
             {
                 Vector3 offset = dog.position - owner.position; offset.y = 0;
                 bool returned = offset.magnitude <= deliveryRange;
+                if (returned) fetchDelivered = true;
                 holding = false;
                 fetchBall.Launch(transform, mouth.position, Vector3.zero);
                 lastResult = returned ? "Fetch succeeded: ball delivered to the person." : "Ball dropped away from the person.";
@@ -406,7 +423,9 @@ public class GoodBoyGame : MonoBehaviour
         }
         else if (action == "wait")
         { yield return new WaitForSeconds(Mathf.Clamp(amount, .1f, 2)); lastResult = "Wait completed."; }
-        else if (action == "finish") lastResult = instruction.source == "placeholder" ? instruction.reason : "Model marked the command complete.";
+        else if (action == "finish") lastResult = instruction.source == "placeholder" ? instruction.reason
+            : fetchDelivered ? "Fetch succeeded: ball delivered to the person. Task complete."
+            : "Task complete.";
         else lastResult = "Rejected unknown action: " + action;
         ResetLegs();
         busy = false;
@@ -415,14 +434,18 @@ public class GoodBoyGame : MonoBehaviour
 
     string CaptureObservation()
     {
+        // A decision must see the final heading, not the chase camera's eased pose.
+        UpdateCamera(true);
         const int width=960, height=540;
         var target = RenderTexture.GetTemporary(width, height, 24);
         var previousTarget = dogCamera.targetTexture;
         var previousActive = RenderTexture.active;
+        float previousAspect = dogCamera.aspect;
         Texture2D image = null;
         try
         {
             dogCamera.targetTexture = target;
+            dogCamera.aspect = (float)width / height;
             dogCamera.Render();
             RenderTexture.active = target;
             image = new Texture2D(width, height, TextureFormat.RGB24, false);
@@ -433,22 +456,106 @@ public class GoodBoyGame : MonoBehaviour
         finally
         {
             dogCamera.targetTexture = previousTarget;
+            dogCamera.aspect = previousAspect;
             RenderTexture.active = previousActive;
             RenderTexture.ReleaseTemporary(target);
             if (image) Destroy(image);
         }
     }
 
+    bool InteractionReady()
+    {
+        Vector3 offset = (holding ? owner.position : ball.position) - dog.position;
+        offset.y = 0;
+        return holding ? offset.magnitude <= deliveryRange
+            : offset.magnitude <= pickupRange && ball.position.y < 1.5f;
+    }
+
+    void RefreshTaskState()
+    {
+        if (fetchDelivered)
+        {
+            remainingPlan.Clear(); activeStep = null; TaskState = "complete"; return;
+        }
+        while (activeStep != null && activeStep.action == "get_ball" && holding) AdvancePlan();
+        if (activeStep == null) { TaskState = "complete"; return; }
+        fetchTask = activeStep.action == "get_ball" || activeStep.action == "deliver_ball";
+        TaskState = !fetchTask ? "perform_action"
+            : holding ? (InteractionReady() ? "drop" : "approach_owner")
+            : (InteractionReady() ? "pick_up" : "approach_ball");
+    }
+
+    void AdvancePlan()
+    {
+        activeStep = remainingPlan.Count > 0 ? remainingPlan.Dequeue() : null;
+    }
+
+    public void BeginCommand(string userCommand)
+    {
+        command = userCommand;
+        BeginAI();
+    }
+
     public void BeginAI()
     {
-        if (busy || aiRunning || string.IsNullOrWhiteSpace(command)) return;
-        SetCommandEditing(false);
+        if (string.IsNullOrWhiteSpace(command)) return;
+        var pending = new List<DogPlanStep>();
+        if (activeStep != null) pending.Add(activeStep);
+        pending.AddRange(remainingPlan);
+        string previousSession = session;
+        string previousState = TaskState;
+        string feedback = activeStep != null ? lastResult : "Ready for a new instruction.";
+        Cancel();
         orbit = 0;
         session = Guid.NewGuid().ToString("N");
         decisions = 0;
+        fetchDelivered = false;
+        aiRunning = true;
+        activeCommand = command;
+        TaskState = "planning";
         actionSource = "VLM server";
         lastJson = "Waiting for server response…";
-        StartCoroutine(AILoop(generation));
+        StartCoroutine(PlanAndRun(generation, pending.ToArray(), previousSession, previousState, feedback));
+    }
+
+    IEnumerator PlanAndRun(int run, DogPlanStep[] pending, string previousSession, string previousState, string feedback)
+    {
+        var observation = new DogObservation { session_id = session, command = activeCommand, image_base64 = CaptureObservation(),
+            holding_ball = holding, state = previousState, last_result = feedback, remaining_plan = pending, supersedes_session = previousSession };
+        status = "Understanding your instruction…";
+        using (var request = new UnityWebRequest(serverUrl.TrimEnd('/') + "/plan", "POST"))
+        {
+            request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(JsonUtility.ToJson(observation)));
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Content-Type", "application/json");
+            request.timeout = 180;
+            yield return request.SendWebRequest();
+            if (run != generation) yield break;
+            lastJson = request.downloadHandler.text;
+            if (request.result != UnityWebRequest.Result.Success)
+            {
+                status = "Could not plan the instruction. Check Server details. " + request.error;
+                showDiagnostics = true; aiRunning = false; TaskState = "idle"; yield break;
+            }
+            DogPlan plan = null;
+            try { plan = JsonUtility.FromJson<DogPlan>(lastJson); }
+            catch (Exception error) { Debug.LogWarning(error.Message); }
+            var supported = new HashSet<string> { "get_ball", "deliver_ball", "sit", "stand", "dance", "roll", "move_forward", "move_backward", "turn_left", "turn_right", "wait", "drop" };
+            if (plan == null || plan.steps == null || plan.steps.Length > 32
+                || Array.Exists(plan.steps, step => step == null || !supported.Contains(step.action) || float.IsNaN(step.amount) || float.IsInfinity(step.amount)))
+            {
+                status = "Server returned an invalid task plan."; aiRunning = false; TaskState = "idle"; yield break;
+            }
+            foreach (var step in plan.steps)
+            {
+                remainingPlan.Enqueue(step);
+                if (step.action == "deliver_ball") break;
+            }
+            lastResult = "New plan accepted.";
+            Debug.Log("VLM plan: " + lastJson);
+            AdvancePlan();
+        }
+        yield return AILoop(run);
     }
 
     IEnumerator AILoop(int run)
@@ -457,7 +564,9 @@ public class GoodBoyGame : MonoBehaviour
         while (aiRunning && run == generation && decisions < 80)
         {
             yield return new WaitForSeconds(.3f);
-            var observation = new DogObservation { session_id = session, command = command, image_base64 = CaptureObservation(), last_result = lastResult, holding_ball = holding, step = decisions };
+            RefreshTaskState();
+            var observation = new DogObservation { session_id = session, command = activeCommand, image_base64 = CaptureObservation(), last_result = lastResult, holding_ball = holding, state = TaskState,
+                requested_action = TaskState == "perform_action" ? activeStep.action : "", requested_amount = activeStep != null ? activeStep.amount : 1, step = decisions };
             status = "Looking and thinking… (decision " + (decisions + 1) + ")";
             using (var request = new UnityWebRequest(serverUrl.TrimEnd('/') + "/step", "POST"))
             {
@@ -484,12 +593,39 @@ public class GoodBoyGame : MonoBehaviour
                 catch (Exception error) { status = "Invalid server response: " + error.Message; }
                 if (action == null) break;
                 bool placeholder = action.source == "placeholder";
-                actionSource = placeholder ? "PLACEHOLDER demo" : "VLM server";
+                actionSource = placeholder ? "PLACEHOLDER demo" : action.source == "state_machine" ? "Task controller" : "VLM server";
                 serverStatus = placeholder ? "PLACEHOLDER • " + action.fallback_error : "Connected • " + serverUrl;
                 decisions++;
+                if (!placeholder)
+                {
+                    bool navigation = action.action == "move_forward" || action.action == "move_backward"
+                        || action.action == "turn_left" || action.action == "turn_right" || action.action == "wait";
+                    bool allowed = (TaskState == "approach_ball" || TaskState == "approach_owner") ? navigation
+                        : TaskState == "perform_action" ? action.action == activeStep.action
+                        : TaskState == "pick_up" ? action.action == "pick_up"
+                        : TaskState == "drop" ? action.action == "drop"
+                        : action.action == "finish";
+                    if (!allowed)
+                    {
+                        lastResult = "Rejected " + action.action + " during " + TaskState + ". Follow the current state.";
+                        Debug.LogWarning(lastResult);
+                        continue;
+                    }
+                }
                 Debug.Log(actionSource + " decision " + decisions + ": " + JsonUtility.ToJson(action));
                 yield return Execute(action);
-                if (action.action == "finish") break;
+                if (TaskState == "perform_action" && action.action == activeStep.action)
+                {
+                    if (lastResult.IndexOf("failed", StringComparison.OrdinalIgnoreCase) >= 0)
+                    { status = "Plan stopped: " + lastResult; break; }
+                    AdvancePlan();
+                }
+                RefreshTaskState();
+                if (action.action == "finish")
+                {
+                    remainingPlan.Clear(); activeStep = null; command = ""; activeCommand = "";
+                    break;
+                }
             }
         }
         if (decisions >= 80) status = "Stopped at 80 decisions. Give a new command to continue.";
@@ -508,7 +644,11 @@ public class GoodBoyGame : MonoBehaviour
             else
             {
                 var health = JsonUtility.FromJson<BridgeHealth>(request.downloadHandler.text);
-                serverStatus = health.provider + " / " + health.model + (health.key_configured ? " • key configured" : " • API key missing");
+                serverStatus = health.provider + " / " + health.model;
+                if (health.provider == "openai")
+                    serverStatus += health.key_configured ? " • key configured" : " • API key missing";
+                else if (health.provider == "ollama")
+                    serverStatus += " • no API key required";
                 if (health.mode == "placeholder") serverStatus = "PLACEHOLDER mode • scripted demos, no API calls";
                 else if (health.fallback_enabled) serverStatus += " • fallback enabled";
             }
@@ -542,7 +682,7 @@ public class GoodBoyGame : MonoBehaviour
         GUI.matrix = Matrix4x4.TRS(Vector3.zero, Quaternion.identity, Vector3.one * scale);
         float width = Screen.width / scale, height = Screen.height / scale;
         if (Event.current.type == EventType.MouseDown)
-            SetCommandEditing(!busy && !aiRunning && CommandRect(width,height).Contains(Event.current.mousePosition));
+            SetCommandEditing(CommandRect(width,height).Contains(Event.current.mousePosition));
         if (Event.current.type == EventType.KeyDown && editingCommand &&
             (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter || Event.current.keyCode == KeyCode.Escape))
         { SetCommandEditing(false); Event.current.Use(); }
@@ -551,7 +691,7 @@ public class GoodBoyGame : MonoBehaviour
         GUI.Label(new Rect(36, 29, 345, 40), "WHO'S A GOOD BOY?", titleStyle);
         GUI.Label(new Rect(36, 71, 340, 45), "A vision-guided dog fetch simulator\nThrow. Command. Observe.", smallStyle);
         Panel(new Rect(width - 300, 20, 280, 125));
-        GUI.Label(new Rect(width - 284, 32, 250, 105), "DOG STATUS\n" + (holding ? "Carrying red ball" : seated ? "Sitting" : "Ready to explore") + "\n" + actionSource + ": " + lastAction + "\nServer decisions: " + decisions, bodyStyle);
+        GUI.Label(new Rect(width - 284, 32, 250, 105), "DOG STATUS\n" + (aiRunning || TaskState == "complete" ? TaskState == "perform_action" ? activeStep?.action : TaskState.Replace('_', ' ') : holding ? "Carrying red ball" : seated ? "Sitting" : "Ready to explore") + "\n" + actionSource + ": " + lastAction + "\nServer decisions: " + decisions, bodyStyle);
 
         Panel(new Rect(410, 20, width - 730, 100));
         GUI.Label(new Rect(425, 29, width-760, 40), serverStatus, smallStyle);
@@ -572,10 +712,11 @@ public class GoodBoyGame : MonoBehaviour
         GUI.Label(new Rect(36, height - 258, 425, 26), proximity, bodyStyle);
         Panel(new Rect(20, height - 225, width - 40, 205));
         GUI.Label(new Rect(36, height - 215, width - 72, 45), status, bodyStyle);
-        GUI.enabled = !busy && !aiRunning;
+        GUI.enabled = true;
         GUI.SetNextControlName("DogCommand");
         command = GUI.TextField(CommandRect(width,height), command, inputStyle);
-        if (GUI.Button(new Rect(width - 180, height - 163, 144, 40), "ASK DOG / VLM", buttonStyle)) BeginAI();
+        if (GUI.Button(new Rect(width - 180, height - 163, 144, 40), aiRunning ? "UPDATE TASK" : "ASK DOG / VLM", buttonStyle)) BeginAI();
+        GUI.enabled = !busy && !aiRunning;
         string[] labels = { "Throw random", "Sit", "Stand", "Dance", "Roll", "Pick up", "Drop" };
         string[] actions = { "", "sit", "stand", "dance", "roll", "pick_up", "drop" };
         for (int i = 0; i < labels.Length; i++)

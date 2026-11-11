@@ -18,7 +18,27 @@ public class DogObservation
     public string image_base64;
     public string last_result;
     public bool holding_ball;
+    public string state = "command";
+    public string requested_action = "";
+    public float requested_amount = 1;
+    public DogPlanStep[] remaining_plan;
+    public string supersedes_session;
     public int step;
+}
+
+[Serializable]
+public class DogPlanStep
+{
+    public string action;
+    public float amount = 1;
+}
+
+[Serializable]
+public class DogPlan
+{
+    public string reason;
+    public string source;
+    public DogPlanStep[] steps;
 }
 
 [Serializable]
