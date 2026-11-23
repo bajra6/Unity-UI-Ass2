@@ -22,6 +22,8 @@ public class DogObservation
     public string state = "command";
     public string requested_action = "";
     public float requested_amount = 1;
+    public string requested_target = "";
+    public bool destination_tracked;
     public DogPlanStep[] remaining_plan;
     public string supersedes_session;
     public int step;
@@ -32,6 +34,7 @@ public class DogPlanStep
 {
     public string action;
     public float amount = 1;
+    public string target = "";
 }
 
 [Serializable]

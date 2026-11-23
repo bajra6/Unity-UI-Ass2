@@ -23,7 +23,7 @@ from placeholder import make_plan, next_action
 
 ACTIONS = (
     "move_forward", "move_backward", "turn_left", "turn_right", "pick_up",
-    "drop", "sit", "stand", "dance", "roll", "wait", "finish",
+    "drop", "sit", "stand", "dance", "roll", "pee", "sniff", "arrive", "wait", "finish",
 )
 SCHEMA = {
     "type": "object",
@@ -44,7 +44,7 @@ Choose exactly ONE next action using the JSON schema below. Never invent coordin
 move_forward/move_backward: amount is meters, 0.1 to 1.5.
 turn_left/turn_right: amount is degrees, 5 to 90. Left means the dog's left.
 pick_up: face the red ball and approach within 2 meters of the dog's center.
-drop: after carrying the ball back within 3 meters of the person in blue.
+drop: after carrying the ball back within 2 meters of the person in blue.
 sit, stand, dance, roll are completed animations. If requested first, do them once before fetching.
 wait: amount is seconds, 0.1 to 2. finish: only when the user's whole task is complete.
 Ground every decision in the CURRENT image. Previous decisions are not evidence of
@@ -75,7 +75,7 @@ Navigate to the person exactly as you approached the ball:
 3. If visible LEFT of the dog's forward direction, turn_left 10-20 degrees.
    If visible RIGHT, turn_right 10-20 degrees. Align before walking; do not walk past them.
 4. If ahead and far away, move_forward 1.0-1.5 meters. If nearby, use 0.3-0.6 meters.
-5. When close (within 3 meters), try drop. Read its feedback before finishing.
+5. When close (within 2 meters), try drop. Read its feedback before finishing.
 Never pick_up again. Do not approach the ball attached to your mouth.
 Choose exactly ONE action. Movement amount is meters (0.1-1.5), turn amount is degrees
 (5-90), wait amount is seconds (0.1-2). Return JSON with action, amount, and reason.
@@ -84,9 +84,9 @@ Schema:
 """ + json.dumps(SCHEMA)
 
 NAVIGATION_ACTIONS = ("move_forward", "move_backward", "turn_left", "turn_right", "wait")
-FETCH_STATES = ("perform_action", "approach_ball", "pick_up", "approach_owner", "drop", "complete")
-ANIMATION_ACTIONS = ("sit", "stand", "dance", "roll")
-PLAN_ACTIONS = ("get_ball", "deliver_ball", *ANIMATION_ACTIONS, *NAVIGATION_ACTIONS, "drop")
+FETCH_STATES = ("approach_target", "perform_action", "approach_ball", "pick_up", "approach_owner", "drop", "complete")
+ANIMATION_ACTIONS = ("sit", "stand", "dance", "roll", "pee", "sniff")
+PLAN_ACTIONS = ("go_to", "get_ball", "deliver_ball", *ANIMATION_ACTIONS, *NAVIGATION_ACTIONS, "drop")
 PRIMITIVE_ACTIONS = (*ANIMATION_ACTIONS, *NAVIGATION_ACTIONS, "drop")
 PLAN_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -94,15 +94,23 @@ PLAN_SCHEMA = {
         "reason": {"type": "string"},
         "steps": {"type": "array", "maxItems": 32, "items": {
             "type": "object", "additionalProperties": False,
-            "properties": {"action": {"type": "string", "enum": list(PLAN_ACTIONS)}, "amount": {"type": "number"}},
-            "required": ["action", "amount"]}},
+            "properties": {"action": {"type": "string", "enum": list(PLAN_ACTIONS)}, "amount": {"type": "number"}, "target": {"type": "string"}},
+            "required": ["action", "amount", "target"]}},
     }, "required": ["reason", "steps"],
 }
 PLAN_SYSTEM = """Interpret the user's instruction into an ordered plan for a dog simulator.
 Use the screenshot, carrying state and remaining plan to understand the situation.
 Available skills: get_ball (navigate to and pick up the red ball), deliver_ball
 (navigate to the blue owner with the carried ball and drop it), sit, stand, dance,
-roll, move_forward, move_backward, turn_left, turn_right, wait, drop (release here).
+roll, pee (raise a hind leg and urinate here), sniff (sniff the ground here),
+go_to (approach a described destination), move_forward, move_backward, turn_left, turn_right, wait, drop.
+Every step has a target string: use an empty string except for go_to.
+For go_to use pink_person for the pink-shirt person, blue_person for the blue owner,
+red_ball for the ball, or a brief visual description such as "nearest tree" or "left fence".
+For an action at a named place, plan go_to(target) then that action. "Pee here" needs only pee.
+In this game, "assert dominance" means go_to(pink_person), pee, unless the user specifies another target.
+Pee and sniff may be requested anywhere and at any stage; do not fetch unless requested.
+Do not replace go_to with guessed movement commands. Each approach uses fresh screenshots.
 A FETCH means BOTH pickup AND return: get_ball then deliver_ball. If already carrying, use deliver_ball only.
 get_ball is pickup only. deliver_ball is the COMPLETE return trip, not a single movement.
 Do not substitute move_forward for deliver_ball, including when the user says "continue bringing it back".
@@ -132,7 +140,12 @@ def validate_plan(value):
     for step in value["steps"]:
         if not isinstance(step, dict) or step.get("action") not in PLAN_ACTIONS:
             raise ValueError("Plan contains an unsupported skill")
-        if step["action"] in ("get_ball", "deliver_ball"):
+        if step["action"] == "go_to":
+            target = step.get("target")
+            if not isinstance(target, str) or not target.strip() or len(target) > 160:
+                raise ValueError("go_to requires a visual target description of at most 160 characters")
+            steps.append({"action": "go_to", "amount": 1, "target": target.strip()})
+        elif step["action"] in ("get_ball", "deliver_ball"):
             steps.append({"action": step["action"], "amount": 1})
         else:
             action = validate_action(step)
@@ -141,6 +154,7 @@ def validate_plan(value):
             break  # Delivery always terminates the task, including queued instructions.
     return {"reason": str(value.get("reason", ""))[:500], "steps": steps, "source": "vlm"}
 STATE_GOALS = {
+    "approach_target": "Approach the requested destination, then perform the next planned action.",
     "perform_action": "Complete the requested animation before advancing the fetch task.",
     "approach_ball": "Approach the RED BALL on the grass. Ignore the person for now.",
     "pick_up": "The ball is within pickup range. Pick it up now; do not move or turn.",
@@ -169,26 +183,39 @@ Do not copy previous visual claims or invent coordinates. Inspect the new image 
 """
 
 def schema_for_state(state):
-    if state not in ("approach_ball", "approach_owner"):
+    if state not in ("approach_ball", "approach_owner", "approach_target"):
         return SCHEMA
     properties = {**SCHEMA["properties"],
                   "action": {"type": "string", "enum": list(NAVIGATION_ACTIONS)}}
     required = list(SCHEMA["required"])
-    if state in ("approach_ball", "approach_owner"):
-        properties = {"target_screen_x": {"type": "number", "minimum": -1, "maximum": 1}, **properties}
-        required.insert(0, "target_screen_x")
+    if state in ("approach_ball", "approach_owner", "approach_target"):
+        properties = {"target_screen_x": {"type": "number", "minimum": -1, "maximum": 1},
+                      "target_screen_y": {"type": "number", "minimum": -1, "maximum": 1}, **properties}
+        required[0:0] = ["target_screen_x", "target_screen_y"]
+    if state == "approach_target":
+        properties["target_close"] = {"type": "boolean"}
+        required.append("target_close")
     return {**SCHEMA, "properties": properties, "required": required}
 
 
-TARGET_ALIGNMENT = """First report target_screen_x: the horizontal center of the CURRENT TARGET
-in the CURRENT image, normalized 0 at the left edge, 0.5 at center, 1 at the right edge.
+TARGET_ALIGNMENT = """First report target_screen_x AND target_screen_y for the center of the CURRENT TARGET
+in the CURRENT image. Coordinates are normalized: x=0 at left, x=1 at right;
+y=0 at TOP, y=1 at BOTTOM, y=0.5 at the horizontal halfway line.
 In approach_ball the target is the RED BALL ON THE GRASS; ignore the person.
 In approach_owner the target is the BLUE PERSON'S TORSO; ignore the carried red ball.
-Report -1 ONLY if that target is not visible. Do not report the dog, shadows, or an
+In approach_target use ONLY the requested destination; distinguish pink clothing from blue.
+For approach_target report target_close=true ONLY when visibly within about 1 meter of
+that destination and able to act there. A target merely visible in the distance is NOT close.
+The controller checks distance itself for named people and the ball. For other destinations,
+use visual size, ground contact and perspective; if uncertain, report false and approach slowly.
+Report BOTH x=-1 and y=-1 ONLY if that target is not visible. Do not report the dog, shadows, or an
 imagined target position. The image center is the dog's forward axis.
-The middle 20% of the screen (x from 0.40 through 0.60 inclusive) counts as aligned:
-walk FORWARD without turning. If x < 0.40 turn LEFT first; if x > 0.60 turn RIGHT first.
-Reobserve after turning; do not walk until the target is in this center band.
+The forward-aligned zone is the UPPER HALF of the middle 20%: x from 0.40 through
+0.60 inclusive AND y from 0 through 0.50 inclusive. Only there walk FORWARD.
+If x < 0.40 turn LEFT first; if x > 0.60 turn RIGHT first. If x is centered but
+y > 0.50, the target is low beside/near the dog: take a short backward step to
+reposition, then reobserve. A low visible target is NOT absent; do not start search
+turns or continue forward past it. Unity still handles pickup/drop as soon as in range.
 A wall behind a visible target is not a reason to abandon it. If the obstacle sensor
 is true but movement has NOT collided, approach a centered target in short steps.
 Unity handles pickup/drop once in range. An actual collision permits a large escape turn.
@@ -197,18 +224,21 @@ Unity handles pickup/drop once in range. An actual collision permits a large esc
 
 def align_to_target(action):
     x = action["target_screen_x"]
+    y = action["target_screen_y"]
     if x == -1:
         action["action"] = action["action"] if action["action"] in ("turn_left", "turn_right") else "turn_right"
         action["amount"] = 45
+    elif .4 <= x <= .6 and y > .5:
+        action["action"], action["amount"] = "move_backward", .25
     elif .4 <= x <= .6:
-        # The middle 20% of the image is aligned, including both boundaries.
+        # Upper half of the middle 20%, inclusive at its boundaries.
         amount = action["amount"] if action["action"] == "move_forward" else .6
         action["action"], action["amount"] = "move_forward", min(1.5, max(.1, amount))
     else:
         action["action"] = "turn_left" if x < .5 else "turn_right"
         action["amount"] = round(min(35, max(5, abs(x - .5) * 90)), 1)
     action["navigation_guard"] = "target_visual_alignment"
-    action["reason"] = f"Target visual alignment (x={x:.3f}). Model: " + action["reason"]
+    action["reason"] = f"Target visual alignment (x={x:.3f}, y={y:.3f}). Model: " + action["reason"]
     return action
 
 
@@ -312,8 +342,12 @@ class VisionBridge:
             raise ValueError("Image must be JPEG or PNG")
         with self.lock:
             self.current_state = state
+            target = observation.get("requested_target", "")
+            if state == "approach_target" and (not isinstance(target, str) or not target.strip() or len(target) > 160):
+                raise ValueError("approach_target requires a target description")
+            search_scope = state + ":" + target if state == "approach_target" else state
             search = self.search_directions.get(session)
-            if search is not None and search[0] != state:
+            if search is not None and search[0] != search_scope:
                 self.search_directions.pop(session, None)
                 search = None
             previous = self.sessions.get(session, [])
@@ -359,12 +393,14 @@ class VisionBridge:
             if state in FETCH_STATES:
                 goal = (f"Perform {requested_action} now. Finish this planned action before advancing."
                         if state == "perform_action" else STATE_GOALS[state])
+                if state == "approach_target":
+                    goal = "Approach ONLY this destination: " + target + ". Get close before performing the next action."
                 if state == "complete" and not feedback.startswith("Fetch succeeded"):
                     goal = "All planned actions are complete. Finish the task and clear its context."
                 # State transitions, not old action sequences, define the next subtask.
                 messages = [
                     {"role": "system", "content": NAVIGATION_SYSTEM + "\nCURRENT STATE: " + state
-                     + ("\n" + TARGET_ALIGNMENT if state in ("approach_ball", "approach_owner") else "")
+                     + ("\n" + TARGET_ALIGNMENT if state in ("approach_ball", "approach_owner", "approach_target") else "")
                      + "\nCURRENT GOAL: " + goal + "\nSchema: " + json.dumps(schema_for_state(state))},
                     {"role": "user", "content": f"Original user request (overall context): {command}\n"
                      f"State: {state}\nCarrying ball: {holding}\nLatest action result: {feedback}\n"
@@ -406,7 +442,7 @@ class VisionBridge:
                     self.fallback_sessions[session] = {"plan": plan, "fetch": fetch, "cursor": 0, "error": error}
                     print(f"[{session[:8]}] PLACEHOLDER fallback: {error}", flush=True)
                     action = next_action(self.fallback_sessions[session])
-            navigating = state in ("approach_ball", "approach_owner") and action.get("source") == "vlm"
+            navigating = state in ("approach_ball", "approach_owner", "approach_target") and action.get("source") == "vlm"
             escape = navigating and (collided or (obstacle_ahead and action["target_screen_x"] == -1))
             if navigating and not escape:
                 action = align_to_target(action)
@@ -425,7 +461,7 @@ class VisionBridge:
                 if action["target_screen_x"] == -1:
                     # Apply AFTER obstacle avoidance so it cannot reverse an ongoing search.
                     direction = search[1] if search else (action["action"] if action["action"] in ("turn_left", "turn_right") else "turn_right")
-                    self.search_directions[session] = (state, direction)
+                    self.search_directions[session] = (search_scope, direction)
                     action["amount"] = max(60 if escape else 45, action["amount"] if action["action"].startswith("turn_") else 0)
                     action["action"] = direction
                     action["search_direction"] = direction
@@ -433,6 +469,10 @@ class VisionBridge:
                     action["reason"] = f"Target absent; keep searching {direction}. Model: " + action["reason"]
                 else:
                     self.search_directions.pop(session, None)
+            if (navigating and state == "approach_target" and not collided
+                    and .4 <= action["target_screen_x"] <= .6 and action["target_close"]
+                    and observation.get("destination_tracked") is not True):
+                action.update(action="arrive", amount=.1, reason="Visually reached the requested destination.")
             previous.append("Feedback: " + str(observation.get("last_result", ""))[:1000])
             previous.append("Decision: " + json.dumps({"action": action["action"], "amount": action["amount"]}))
             self.sessions[session] = previous[-160:]
@@ -469,6 +509,7 @@ class VisionBridge:
                   "holding_ball": bool(observation.get("holding_ball", observation.get("holding_baton", False))),
                   "state": self.current_state,
                   "obstacle_ahead": observation.get("obstacle_ahead") is True,
+                  "requested_target": observation.get("requested_target", ""),
                   "requested_action": observation.get("requested_action", ""),
                   "provider": self.provider, "model": self.model,
                   "image_file": image_path.relative_to(self.trace_dir).as_posix(),
@@ -504,11 +545,20 @@ class VisionBridge:
         action = validate_action(value)
         if action["action"] not in schema["properties"]["action"]["enum"]:
             raise ValueError("Model action is not allowed in the current task state")
-        if self.current_state in ("approach_ball", "approach_owner"):
+        if self.current_state in ("approach_ball", "approach_owner", "approach_target"):
             x = value.get("target_screen_x")
             if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or not (x == -1 or 0 <= x <= 1):
                 raise ValueError("Target position must be -1 (absent) or a normalized image coordinate")
+            y = value.get("target_screen_y")
+            if (isinstance(y, bool) or not isinstance(y, (int, float)) or not math.isfinite(y)
+                    or not ((x == -1 and y == -1) or (x != -1 and 0 <= y <= 1))):
+                raise ValueError("Target vertical position must match visibility and use top-to-bottom normalized coordinates")
             action["target_screen_x"] = x
+            action["target_screen_y"] = y
+            if self.current_state == "approach_target":
+                if not isinstance(value.get("target_close"), bool):
+                    raise ValueError("target_close must be a boolean")
+                action["target_close"] = value["target_close"]
         return action
 
     def _model_json(self, messages, raw_image, image, schema, name="dog_action"):
@@ -564,7 +614,7 @@ def make_handler(bridge):
 
         def do_GET(self):
             if self.path == "/health":
-                self.send_json(200, {"status": "ok", "protocol_version": 2, "model": bridge.model, "provider": bridge.provider,
+                self.send_json(200, {"status": "ok", "protocol_version": 3, "model": bridge.model, "provider": bridge.provider,
                                      "mode": bridge.mode, "fallback_enabled": bridge.mode != "live",
                                      "key_configured": bool(bridge.api_key) if bridge.provider == "openai" else None,
                                      "note": "Bridge health does not confirm API credits or model availability."})

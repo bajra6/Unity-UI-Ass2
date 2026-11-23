@@ -9,7 +9,7 @@ Open `Assets/Scenes/GoodBoyFetch.unity` and press Play. The grassland and contro
 - W/S: walk forward/backward; A/D: turn. Keyboard movement is ready at startup. Click inside the Game view if another window has focus. Only intentionally editing the command box pauses WASD; Enter/Esc or clicking outside restores it. The footer shows the current input mode.
 - Click a visible floor point in the middle of the game view to throw toward it. T or **Throw random** throws toward a random point.
 - Hold right mouse: orbit the chase camera during manual testing.
-- Buttons: sit, stand, dance, roll, pick up, drop.
+- Buttons: sit, stand, dance, roll, sniff, pee, pick up, drop.
 - Esc or Stop: cancel the active task.
 - The blue figure is the owner; the golden dog is controlled by the agent.
 - Pick up while facing the red ball within **2 meters** of the dog's center. Drop within **2 meters** of the owner to complete delivery. The HUD shows the distance.
@@ -59,7 +59,7 @@ An optional `--provider ollama --model YOUR_VISION_MODEL` mode is also available
 
 For local Qwen3-VL, keep Ollama running and use `python Server/server.py --provider ollama --model qwen3-vl:4b-instruct --api-url http://127.0.0.1:11434 --mode live --api-timeout 120` from the project root. `live` makes model failures visible instead of running the scripted fallback. Restart the Python bridge after changing its code.
 
-If Unity reports `Unknown endpoint` for `/plan`, an older server may still be running on port 8000. Stop that process and start the updated bridge; editing Python files does not reload a running process. `/health` now reports `protocol_version: 2`, and Unity warns when connected to an older bridge.
+If Unity reports `Unknown endpoint` for `/plan`, an older server may still be running on port 8000. Stop that process and start the updated bridge; editing Python files does not reload a running process. `/health` now reports `protocol_version: 3`, and Unity warns when connected to an older bridge.
 
 Try: "Sit." Then "Dance, then find the red ball and bring it back to the person in blue."
 
@@ -92,8 +92,30 @@ The `Good Boy > Create Fetch Scene` menu creates a dedicated scene if absent and
 
 With this project open in Unity, run `python Server/verify_unity.py --project "D:\bajra\IISc\Assignment\IUI\A2\Unity-UI-Ass2" --running-editor` to additionally test both HTTP hops using a local mock vision provider. Add `--placeholder-fallback` to simulate an API outage and verify the fallback sequence. Tests also inject keyboard input to check immediate WASD, typing isolation and Enter restoring movement. They make no paid calls. A passing mock test verifies the integration, **not** the real model's visual navigation ability; evaluate that with a working local or online vision model.
 
-Both ball and owner approach use Qwen's `target_screen_x` (0=left, 0.5=center, 1=right; -1=absent). The active target is the floor ball before pickup and the blue person's torso afterward. The middle 20% (0.40 through 0.60 inclusive) counts as aligned: move forward without turning. Outside it, turn toward the target before walking and inspect a new screenshot. No target world position is used for steering; Unity uses distance for pickup/delivery. The outdoor chase camera stays directly behind the dog, including near the fence. Raw visual estimates and adjusted actions remain in the trace logs.
+Ball, owner, and described-destination approach use Qwen's `target_screen_x` and `target_screen_y` (x: left=0/right=1; y: top=0/bottom=1; both -1 when absent). The active target is the floor ball before pickup and the blue person's torso afterward. The forward zone is the upper half of the middle 20%: x=0.40?0.60 and y=0?0.50 inclusive. Targets to either side require a turn. A centered target below the midpoint triggers a short 0.25 m backward reposition followed by a new screenshot, not another forward stride or a search turn. Pickup/drop distance and timing are unchanged. No target world position is used for steering; Unity uses distance for pickup/delivery. The outdoor chase camera stays directly behind the dog, including near the fence. Raw visual estimates and adjusted actions remain in the trace logs.
 
 The environment is a procedural sunny meadow with textured ground, short grass in the fetch clearing, taller grass and trees around its edges, distant hills, and a low wooden boundary fence. `GrasslandEnvironment.cs` generates it without additional asset downloads. Grass is decorative and does not block the ball; trees are outside the fetch clearing.
 
 When the current target is absent, the server remembers the first search turn direction for that session and target. Every subsequent search turn keeps that direction, including obstacle-escape turns, until the target is visible. Seeing the target, changing targets, completing the task, or submitting a new plan clears the commitment. Logs include `search_direction` on these actions.
+
+
+The meadow now includes a second person wearing pink. `pee` and `sniff` work as standalone
+commands or within a VLM-generated plan. Examples: "Pee here", "Go to the pink guy and pee",
+"Go to the blue guy, sniff, then pee", or "Pee by the left fence". In this game's planner,
+"assert dominance" means approach the pink-shirt person and pee, unless another target is specified.
+
+The generic `go_to` skill carries a `target` description. Named destinations use `pink_person`,
+`blue_person`, or `red_ball`; other destinations are described visually. The VLM still steers
+from screenshots with the upper-middle alignment rule and persistent search direction. Unity
+stops within 1.2 m of named destinations; other destinations use the model's visual `target_close`
+assessment. Described destinations must be visible/reachable within the fenced area.
+
+Pee is a timed procedural animation: turn sideways, shift weight, raise the right hind leg,
+show a thin gravity-curved stream, lower the leg and return to the starting heading. At a
+named destination, local interaction aiming points the stream toward it after navigation.
+Sniff lowers the body and sweeps the head direction. Stop cancels both pose and stream.
+These use the existing prototype mesh rig rather than motion-capture animation. New clients
+require bridge protocol 3; restart your server manually after updating. Tests leave no game
+server running.
+
+Paw and toe mesh pieces are bound rigidly to their leg joint, with a smooth lower-leg-to-body weight transition. Unity verification checks that their shape is preserved during the raised-leg pee pose, so they cannot leave stretched triangles attached to the ground.

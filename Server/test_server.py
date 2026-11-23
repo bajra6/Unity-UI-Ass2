@@ -14,11 +14,59 @@ from server import VisionBridge, make_handler, validate_action, validate_plan
 
 
 class BridgeTests(unittest.TestCase):
+    def test_forward_zone_is_upper_half_and_low_targets_reposition(self):
+        for state in ('approach_ball', 'approach_owner', 'approach_target'):
+            for y, expected in ((0, 'move_forward'), (.5, 'move_forward'), (.501, 'move_backward'), (1, 'move_backward')):
+                bridge = VisionBridge('test', provider='ollama', mode='live')
+                raw = {'target_screen_x': .5, 'target_screen_y': y, 'target_close': False,
+                       'action': 'move_forward', 'amount': 1.5, 'reason': 'test'}
+                with patch('server.urllib.request.urlopen', return_value=io.StringIO(json.dumps({'message': {'content': json.dumps(raw)}}))):
+                    result = bridge.step(self.observation(state=state, requested_target='pink_person', destination_tracked=True))
+                self.assertEqual(result['action'], expected)
+                self.assertEqual(result['amount'], .25 if y > .5 else 1.5)
+
+    def test_vertical_coordinate_validation_and_visibility_agree(self):
+        for x, y in ((.5, None), (.5, True), (.5, -1), (.5, 1.1), (.5, float('nan')), (-1, .5)):
+            bridge = VisionBridge('test', provider='ollama', mode='live')
+            raw = {'target_screen_x': x, 'target_screen_y': y, 'action': 'move_forward', 'amount': 1, 'reason': 'test'}
+            with patch('server.urllib.request.urlopen', return_value=io.StringIO(json.dumps({'message': {'content': json.dumps(raw)}}))):
+                with self.assertRaisesRegex(ValueError, 'vertical position'):
+                    bridge.step(self.observation(state='approach_ball'))
+
+    def test_destination_plan_keeps_target_and_supports_new_actions(self):
+        plan = validate_plan({'steps': [{'action': 'go_to', 'target': 'pink_person'}, {'action': 'sniff'}, {'action': 'pee'}]})
+        self.assertEqual(plan['steps'][0]['target'], 'pink_person')
+        self.assertEqual([s['action'] for s in plan['steps']], ['go_to', 'sniff', 'pee'])
+        with self.assertRaises(ValueError): validate_plan({'steps': [{'action': 'go_to', 'target': ''}]})
+        bridge = VisionBridge('test', provider='ollama', mode='live')
+        with patch.object(bridge, '_model_action') as model:
+            for name in ('pee', 'sniff'):
+                self.assertEqual(bridge.step(self.observation(state='perform_action', requested_action=name))['action'], name)
+            model.assert_not_called()
+
+    def test_generic_approach_uses_requested_target_and_checks_arrival(self):
+        for tracked, x, close, expected in ((True, .5, True, 'move_forward'), (False, .5, True, 'arrive'),
+                                            (False, .8, True, 'turn_right'), (False, .5, False, 'move_forward')):
+            bridge = VisionBridge('test', provider='ollama', mode='live')
+            raw = {'target_screen_x': x, 'target_screen_y': -1 if x == -1 else .3, 'target_close': close, 'action': 'move_forward', 'amount': .3, 'reason': 'test'}
+            with patch('server.urllib.request.urlopen', return_value=io.StringIO(json.dumps({'message': {'content': json.dumps(raw)}}))) as model:
+                result = bridge.step(self.observation(state='approach_target', requested_target='pink_person', destination_tracked=tracked))
+                self.assertEqual(result['action'], expected)
+                self.assertIn('pink_person', json.loads(model.call_args.args[0].data)['messages'][1]['content'])
+
+    def test_search_commitment_resets_between_described_destinations(self):
+        bridge = VisionBridge('test', provider='ollama', mode='live')
+        for target, direction in (('pink_person', 'turn_right'), ('nearest tree', 'turn_left')):
+            with patch.object(bridge, '_model_action', return_value={'target_screen_x': -1, 'target_screen_y': -1, 'target_close': False,
+                               'action': direction, 'amount': 45, 'reason': 'test'}):
+                result = bridge.step(self.observation(state='approach_target', requested_target=target))
+            self.assertEqual(result['action'], direction)
+
     def test_search_keeps_first_direction_even_when_model_and_obstacles_reverse(self):
         for state in ('approach_ball', 'approach_owner'):
             for first, other in (('turn_left', 'turn_right'), ('turn_right', 'turn_left')):
                 bridge = VisionBridge('test', provider='ollama', mode='live')
-                replies = [{'target_screen_x': -1, 'action': a, 'amount': 10, 'reason': 'test'}
+                replies = [{'target_screen_x': -1, 'target_screen_y': -1, 'action': a, 'amount': 10, 'reason': 'test'}
                            for a in (first, other, 'move_backward', other)]
                 with patch.object(bridge, '_model_action', side_effect=replies):
                     for i in range(4):
@@ -29,7 +77,7 @@ class BridgeTests(unittest.TestCase):
     def test_search_unlocks_when_target_visible_or_changes_and_is_session_local(self):
         bridge = VisionBridge('test', provider='ollama', mode='live')
         def step(session, state, x, proposed):
-            with patch.object(bridge, '_model_action', return_value={'target_screen_x': x, 'action': proposed, 'amount': 10, 'reason': 'test'}):
+            with patch.object(bridge, '_model_action', return_value={'target_screen_x': x, 'target_screen_y': -1 if x == -1 else .3, 'action': proposed, 'amount': 10, 'reason': 'test'}):
                 return bridge.step(self.observation(session_id=session, state=state))['action']
         self.assertEqual(step('a', 'approach_ball', -1, 'turn_right'), 'turn_right')
         self.assertEqual(step('b', 'approach_ball', -1, 'turn_left'), 'turn_left')
@@ -60,7 +108,7 @@ class BridgeTests(unittest.TestCase):
                                           (-1, 'move_forward', 'turn_right')):
                 with self.subTest(state=state, x=x):
                     bridge = VisionBridge('test', provider='ollama', mode='live')
-                    reply = {'target_screen_x': x, 'reason': 'test', 'action': proposed, 'amount': 1.5}
+                    reply = {'target_screen_x': x, 'target_screen_y': -1 if x == -1 else .3, 'reason': 'test', 'action': proposed, 'amount': 1.5}
                     with patch('server.urllib.request.urlopen', return_value=io.StringIO(json.dumps({'message': {'content': json.dumps(reply)}}))):
                         action = bridge.step(self.observation(state=state, holding_ball=state == 'approach_owner'))
                     self.assertEqual(action['action'], expected)
@@ -71,7 +119,7 @@ class BridgeTests(unittest.TestCase):
         for state in ('approach_ball', 'approach_owner'):
             for x in (None, True, -.5, 1.1, float('nan')):
                 bridge = VisionBridge('test', provider='ollama', mode='live')
-                reply = {'target_screen_x': x, 'reason': 'test', 'action': 'move_forward', 'amount': 1}
+                reply = {'target_screen_x': x, 'target_screen_y': -1 if x == -1 else .3, 'reason': 'test', 'action': 'move_forward', 'amount': 1}
                 with patch('server.urllib.request.urlopen', return_value=io.StringIO(json.dumps({'message': {'content': json.dumps(reply)}}))):
                     with self.assertRaisesRegex(ValueError, 'Target position'):
                         bridge.step(self.observation(state=state))
@@ -80,7 +128,7 @@ class BridgeTests(unittest.TestCase):
         for state in ('approach_ball', 'approach_owner'):
             for x, expected, amount in ((.5, 'move_forward', .3), (.8, 'turn_right', 27)):
                 bridge = VisionBridge('test', provider='ollama', mode='live')
-                with patch.object(bridge, '_model_action', return_value={'target_screen_x': x, 'action': 'turn_left', 'amount': 90, 'reason': 'Wall nearby'}):
+                with patch.object(bridge, '_model_action', return_value={'target_screen_x': x, 'target_screen_y': -1 if x == -1 else .3, 'action': 'turn_left', 'amount': 90, 'reason': 'Wall nearby'}):
                     action = bridge.step(self.observation(state=state, obstacle_ahead=True))
                 self.assertEqual((action['action'], action['amount']), (expected, amount))
 
@@ -88,7 +136,7 @@ class BridgeTests(unittest.TestCase):
         for state in ('approach_ball', 'approach_owner'):
             for x, feedback in ((.5, 'Movement blocked by a collision.'), (-1, 'Turn completed.')):
                 bridge = VisionBridge('test', provider='ollama', mode='live')
-                with patch.object(bridge, '_model_action', return_value={'target_screen_x': x, 'action': 'turn_left', 'amount': 10, 'reason': 'test'}):
+                with patch.object(bridge, '_model_action', return_value={'target_screen_x': x, 'target_screen_y': -1 if x == -1 else .3, 'action': 'turn_left', 'amount': 10, 'reason': 'test'}):
                     action = bridge.step(self.observation(state=state, obstacle_ahead=True, last_result=feedback))
                 self.assertEqual((action['action'], action['amount']), ('turn_left', 60))
         bridge = VisionBridge('test', provider='ollama', mode='live')

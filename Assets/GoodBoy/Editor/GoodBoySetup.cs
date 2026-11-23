@@ -92,11 +92,29 @@ public class GoodBoyVerification : MonoBehaviour
 
     void Fail(int code, string message) { Debug.LogError(message); GoodBoySetup.Complete(code,message); }
 
+    System.Collections.Generic.Dictionary<SkinnedMeshRenderer, float[]> FootShapes()
+    {
+        var result = new System.Collections.Generic.Dictionary<SkinnedMeshRenderer, float[]>();
+        foreach (var skin in GameObject.Find("Dog").GetComponentsInChildren<SkinnedMeshRenderer>())
+        {
+            string part = skin.transform.parent.name;
+            if (!part.StartsWith("Toe") && !part.StartsWith("Rounded paw")) continue;
+            var baked = new Mesh(); skin.BakeMesh(baked);
+            var vertices = baked.vertices;
+            var lengths = new float[vertices.Length];
+            for (int i = 0; i < lengths.Length; i++) lengths[i] = Vector3.Distance(vertices[0], vertices[i]);
+            result[skin] = lengths;
+            Destroy(baked);
+        }
+        return result;
+    }
+
     void Capture(string name, bool portrait=false)
     {
         var camera=Camera.main;
         var pos=camera.transform.position;var rot=camera.transform.rotation;
         if(portrait) { camera.transform.position=new Vector3(3.2f,2.1f,1.8f);camera.transform.LookAt(new Vector3(-.5f,.9f,-2.6f)); }
+        if(name=="dominance-view") { camera.transform.position=new Vector3(7,2.2f,1);camera.transform.LookAt(new Vector3(3.5f,.7f,-2.6f)); }
         var rt=RenderTexture.GetTemporary(1600,900,24);
         var oldTarget=camera.targetTexture;var oldActive=RenderTexture.active;
         camera.targetTexture=rt;camera.Render();RenderTexture.active=rt;
@@ -159,6 +177,33 @@ public class GoodBoyVerification : MonoBehaviour
         yield return game.Execute(new DogAction { action = "sit" });
         yield return game.Execute(new DogAction { action = "stand" });
         yield return game.Execute(new DogAction { action = "roll" });
+        var pinkPerson = GameObject.Find("Person in pink");
+        if (!pinkPerson) { Fail(14,"Pink-shirt person is missing."); yield break; }
+        bool pinkTint = false;
+        foreach (var renderer in pinkPerson.GetComponentsInChildren<Renderer>())
+            for (int materialIndex = 0; materialIndex < renderer.sharedMaterials.Length; materialIndex++)
+            {
+                var block = new MaterialPropertyBlock(); renderer.GetPropertyBlock(block, materialIndex);
+                Color tint = block.GetColor("_BaseColor");
+                if (tint.r > .9f && tint.g < .3f && tint.b > .4f) pinkTint = true;
+            }
+        if (!pinkTint) { Fail(18,"Pink character's clothing tint was not applied."); yield break; }
+        yield return game.Execute(new DogAction { action = "sniff" });
+        var feetBefore = FootShapes();
+        if (feetBefore.Count != 16) { Fail(20,"Expected four paw meshes and twelve toes."); yield break; }
+        game.StartCoroutine(game.Execute(new DogAction { action = "pee" }));
+        yield return new WaitForSeconds(2.5f);
+        if (!GameObject.Find("Pee stream")) { Fail(15,"Pee stream did not appear."); yield break; }
+        foreach (var foot in FootShapes())
+            for (int i = 0; i < foot.Value.Length; i++)
+                if (Mathf.Abs(foot.Value[i] - feetBefore[foot.Key][i]) > .002f)
+                { Fail(21,"Raised paw or toe mesh stretched during pee."); yield break; }
+        Capture("pee-view", true);
+        game.Cancel();
+        yield return null;
+        if (GameObject.Find("Pee stream")) { Fail(16,"Stop did not clean up pee effect."); yield break; }
+        yield return game.Execute(new DogAction { action = "pee" });
+        if (game.LastResult != "pee completed.") { Fail(17,"Pee action did not finish."); yield break; }
         yield return game.Execute(new DogAction { action = "move_forward", amount = .5f });
         if (Mathf.Abs(Vector3.Distance(start, dog.position) - .5f) > .15f)
         { Fail(4,"Movement did not travel the requested distance."); yield break; }
@@ -170,7 +215,7 @@ public class GoodBoyVerification : MonoBehaviour
         if (!game.IsHoldingBall || !baton.isKinematic || baton.transform.parent.name != "Mouth attachment")
         { Fail(6,"Pickup at the larger 1.8m range failed."); yield break; }
         watchCarry=true;
-        foreach(string action in new[]{"move_forward","turn_left","dance","sit","stand","roll"})
+        foreach(string action in new[]{"move_forward","turn_left","dance","sit","stand","roll","sniff","pee"})
             yield return game.Execute(new DogAction { action=action,amount=action=="turn_left" ? 60:1 });
         yield return null;
         watchCarry=false;
@@ -217,6 +262,23 @@ public class GoodBoyVerification : MonoBehaviour
             SessionState.EraseString("GoodBoyVerifyUrl");
             SessionState.EraseBool("GoodBoyVerifyPlaceholder");
         }
+        if (Environment.GetEnvironmentVariable("GOODBOY_VERIFY_DOMINANCE") == "1")
+        {
+            controller.enabled=false;dog.position=new Vector3(0,.02f,-2);dog.rotation=Quaternion.identity;controller.enabled=true;
+            game.serverUrl=Environment.GetEnvironmentVariable("GOODBOY_VERIFY_URL");
+            game.BeginCommand("Assert dominance.");
+            bool sawPee = false;
+            float deadline=Time.realtimeSinceStartup+100;
+            while (Time.realtimeSinceStartup < deadline)
+            {
+                if (!sawPee && GameObject.Find("Pee stream")) { sawPee=true; Capture("dominance-view"); }
+                if (game.LastResult=="Task complete.") break;
+                yield return null;
+            }
+            if (!sawPee || game.LastResult!="Task complete." || Vector3.Distance(dog.position,pinkPerson.transform.position)>1.25f)
+            { game.Cancel(); Fail(19,"Dominance flow failed to approach pink person and finish pee."); yield break; }
+            Debug.Log("GOODBOY_DOMINANCE_OK: real VLM plan -> approach pink person -> pee -> finish");
+        }
         controller.enabled=false;dog.position=new Vector3(0,.02f,-2);dog.rotation=Quaternion.identity;controller.enabled=true;
         yield return new WaitForSeconds(.5f);
         Capture("game-view"); Capture("characters",true);
@@ -224,7 +286,7 @@ public class GoodBoyVerification : MonoBehaviour
         yield return game.Execute(new DogAction {action="pick_up"});
         yield return null;
         Capture("carry-view",true);
-        string summary="Startup WASD, typing isolation, Enter restoring WASD, movement, turn, 1.8m pickup, 1.1m delivery, stationary landing, carry through walk/turn/dance/sit/stand/roll, render and HTTP loop passed. Max carry error: "+maxCarryError;
+        string summary="Startup WASD, typing isolation, movement, turn, pickup, delivery, stationary landing, pink clothing, sniff/pee, stop cleanup, carrying during animations and render passed. Max carry error: "+maxCarryError;
         Debug.Log("GOODBOY_PLAY_OK: "+summary);
         GoodBoySetup.Complete(0,summary);
     }
