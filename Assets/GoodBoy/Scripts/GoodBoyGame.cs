@@ -7,7 +7,7 @@ using UnityEngine.InputSystem;
 using UnityEngine.Networking;
 using UnityEngine.Rendering.Universal;
 
-// Room and controls are generated locally; character meshes are bundled CC0 assets.
+// Meadow and controls are generated locally; character meshes are bundled CC0 assets.
 public class GoodBoyGame : MonoBehaviour
 {
     public string serverUrl = "http://127.0.0.1:8000";
@@ -17,7 +17,7 @@ public class GoodBoyGame : MonoBehaviour
     FetchBall fetchBall;
     DogMeshRig dogRig;
     public float pickupRange = 2f;
-    public float deliveryRange = 3f;
+    public float deliveryRange = 2f;
     string serverStatus = "Checking server…";
     string lastJson = "No server response yet.";
     string actionSource = "Manual";
@@ -96,26 +96,17 @@ public class GoodBoyGame : MonoBehaviour
         red = Mat("Red ball", new Color(.95f, .025f, .035f));
         blue = Mat("Blue shirt", new Color(.025f, .24f, .82f));
         mint = Mat("Collar", new Color(.04f, .7f, .55f));
-        Shape("Floor", PrimitiveType.Cube, transform, new Vector3(0, -.15f, 0), new Vector3(20, .3f, 20), grey, true);
-        Shape("North wall", PrimitiveType.Cube, transform, new Vector3(0, 2.5f, 10), new Vector3(20, 5, .25f), white, true);
-        Shape("South wall", PrimitiveType.Cube, transform, new Vector3(0, 2.5f, -10), new Vector3(20, 5, .25f), white, true);
-        Shape("East wall", PrimitiveType.Cube, transform, new Vector3(10, 2.5f, 0), new Vector3(.25f, 5, 20), white, true);
-        Shape("West wall", PrimitiveType.Cube, transform, new Vector3(-10, 2.5f, 0), new Vector3(.25f, 5, 20), white, true);
-        // Subtle seams provide depth cues without adding obstacles.
-        var seam = Mat("Floor seams", new Color(.64f, .69f, .72f));
-        for (int i = -8; i <= 8; i += 2)
-        {
-            Shape("Floor seam", PrimitiveType.Cube, transform, new Vector3(i, .002f, 0), new Vector3(.025f, .004f, 19.5f), seam);
-            Shape("Floor seam", PrimitiveType.Cube, transform, new Vector3(0, .002f, i), new Vector3(19.5f, .004f, .025f), seam);
-        }
-        RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
-        RenderSettings.ambientLight = new Color(.7f, .74f, .8f);
+        var meadow = new GameObject("Grassland environment");
+        meadow.transform.SetParent(transform, false);
+        meadow.AddComponent<GrasslandEnvironment>().Build();
         var lightGo = new GameObject("Soft daylight");
         lightGo.transform.SetParent(transform);
         lightGo.transform.rotation = Quaternion.Euler(50, -25, 0);
         var light = lightGo.AddComponent<Light>();
         light.type = LightType.Directional;
-        light.intensity = 1.5f;
+        light.intensity = 1.35f;
+        light.color = new Color(1f, .94f, .81f);
+        RenderSettings.sun = light;
         light.shadows = LightShadows.Soft;
 
         owner = new GameObject("Owner in blue").transform;
@@ -163,9 +154,9 @@ public class GoodBoyGame : MonoBehaviour
         cameraData.antialiasing = AntialiasingMode.SubpixelMorphologicalAntiAliasing;
         cameraData.antialiasingQuality = AntialiasingQuality.High;
         dogCamera.nearClipPlane = .08f;
-        dogCamera.farClipPlane = 70;
+        dogCamera.farClipPlane = 180;
         dogCamera.backgroundColor = new Color(.85f, .89f, .93f);
-        dogCamera.clearFlags = CameraClearFlags.SolidColor;
+        dogCamera.clearFlags = CameraClearFlags.Skybox;
         cameraGo.AddComponent<AudioListener>();
         UpdateCamera(true);
     }
@@ -252,9 +243,8 @@ public class GoodBoyGame : MonoBehaviour
     {
         Vector3 target = dog.position + Vector3.up * .8f;
         Vector3 offset = Quaternion.Euler(0, dog.eulerAngles.y + orbit, 0) * new Vector3(0, 2.0f, -cameraDistance);
+        // Open meadow: keep the camera directly behind the dog, including at the fence.
         Vector3 desired = target + offset;
-        desired.x = Mathf.Clamp(desired.x, -9.6f, 9.6f);
-        desired.z = Mathf.Clamp(desired.z, -9.6f, 9.6f);
         dogCamera.transform.position = snap ? desired : Vector3.Lerp(dogCamera.transform.position, desired, 10 * Time.deltaTime);
         dogCamera.transform.LookAt(target + dog.forward * .1f);
     }
@@ -558,6 +548,20 @@ public class GoodBoyGame : MonoBehaviour
         yield return AILoop(run);
     }
 
+    bool ObstacleAhead()
+    {
+        // Check the body's forward corridor, ignoring the dog and fetch targets.
+        Vector3 center = dog.TransformPoint(controller.center);
+        foreach (var hit in Physics.SphereCastAll(center, controller.radius, dog.forward,
+                     1.2f, ~0, QueryTriggerInteraction.Ignore))
+        {
+            Transform obstacle = hit.collider.transform;
+            if (obstacle.IsChildOf(dog) || obstacle.IsChildOf(ball.transform) || obstacle.IsChildOf(owner)) continue;
+            if (Mathf.Abs(hit.normal.y) < .5f) return true;
+        }
+        return false;
+    }
+
     IEnumerator AILoop(int run)
     {
         aiRunning = true;
@@ -566,7 +570,7 @@ public class GoodBoyGame : MonoBehaviour
             yield return new WaitForSeconds(.3f);
             RefreshTaskState();
             var observation = new DogObservation { session_id = session, command = activeCommand, image_base64 = CaptureObservation(), last_result = lastResult, holding_ball = holding, state = TaskState,
-                requested_action = TaskState == "perform_action" ? activeStep.action : "", requested_amount = activeStep != null ? activeStep.amount : 1, step = decisions };
+                obstacle_ahead = ObstacleAhead(), requested_action = TaskState == "perform_action" ? activeStep.action : "", requested_amount = activeStep != null ? activeStep.amount : 1, step = decisions };
             status = "Looking and thinking… (decision " + (decisions + 1) + ")";
             using (var request = new UnityWebRequest(serverUrl.TrimEnd('/') + "/step", "POST"))
             {
@@ -644,6 +648,12 @@ public class GoodBoyGame : MonoBehaviour
             else
             {
                 var health = JsonUtility.FromJson<BridgeHealth>(request.downloadHandler.text);
+                if (health.protocol_version < 2)
+                {
+                    serverStatus = "Outdated server: restart Server/server.py (this game requires /plan).";
+                    checkingHealth = false;
+                    yield break;
+                }
                 serverStatus = health.provider + " / " + health.model;
                 if (health.provider == "openai")
                     serverStatus += health.key_configured ? " • key configured" : " • API key missing";

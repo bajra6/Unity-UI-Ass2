@@ -36,7 +36,7 @@ SCHEMA = {
     "required": ["reason", "action", "amount"],
     "additionalProperties": False,
 }
-SYSTEM = """You control a dog in a white 3D room, using the attached chase-camera image.
+SYSTEM = """You control a dog in a grassy outdoor meadow, using the attached chase-camera image.
 The golden dog is at the bottom center, looking toward the center of the image.
 The large red ball is the object to fetch. It stops on landing; it does not roll.
 The person wearing blue is its owner.
@@ -57,7 +57,7 @@ target left of the dog's forward direction -> turn_left; right -> turn_right.
 If the target is already ahead, move_forward, not another search turn. When aligned
 and far away, use 1.0-1.5 meter steps. Shorten to 0.3-0.6 meters near the target and
 try pick_up when close. Recheck the image after each action.
-There is no task requiring you to go to the center of the room.
+There is no task requiring you to go to the center of the clearing.
 Read the latest action feedback; a failed pickup means you are NOT carrying the ball.
 While carrying the ball, search for the person in blue, approach, and drop it.
 Do not repeat a completed dance/roll/sit unless the user asks for repetition.
@@ -142,7 +142,7 @@ def validate_plan(value):
     return {"reason": str(value.get("reason", ""))[:500], "steps": steps, "source": "vlm"}
 STATE_GOALS = {
     "perform_action": "Complete the requested animation before advancing the fetch task.",
-    "approach_ball": "Approach the RED BALL on the floor. Ignore the person for now.",
+    "approach_ball": "Approach the RED BALL on the grass. Ignore the person for now.",
     "pick_up": "The ball is within pickup range. Pick it up now; do not move or turn.",
     "approach_owner": "Approach the PERSON IN BLUE. The ball is already in your mouth; ignore it for navigation.",
     "drop": "The owner is within delivery range. Drop the ball now; do not move or turn.",
@@ -154,10 +154,15 @@ The camera is behind the dog. Compare the target with the dog's forward directio
 Describe where the current target is in reason FIRST, then choose ONE matching action.
 If the target is absent, turn 45 degrees to search. Keep the same search direction until found.
 If the target is visible to the left, turn_left; if to the right, turn_right.
-Use 5-15 degree alignment turns (up to 30 for a target far to one side).
-If aligned and far away, move_forward 1.0-1.5 meters. Use 0.3-0.6 meters when near.
-Do not turn away from a visible, aligned target. Do not go to the center of the room.
-Movement amount is meters (0.1-1.5); turn amount is degrees (5-90); wait is seconds (0.1-2).
+Use 5-30 degree alignment turns (up to 45 for a target far to one side).
+If movement actually collided, turn 60-90 degrees toward open space.
+A nearby wall alone does not override alignment to a visible target.
+Use short forward steps when aligned with a visible target near a wall.
+After escaping, walk along the clear route before realigning; do not immediately undo
+the escape turn toward the same wall. Use recent actions only to avoid repeating a loop.
+If aligned and far away, move_forward 1.0-3.0 meters. Use 0.1-0.9 meters when near.
+Do not turn away from a visible, aligned target. Do not go to the center of the clearing.
+Movement amount is meters (0.1-3.0); turn amount is degrees (5-90); wait is seconds (0.1-2).
 Unity stops movement at interaction range and handles pickup, drop and completion.
 You only navigate. Never choose pick_up, drop or finish during an approach state.
 Do not copy previous visual claims or invent coordinates. Inspect the new image each time.
@@ -166,8 +171,45 @@ Do not copy previous visual claims or invent coordinates. Inspect the new image 
 def schema_for_state(state):
     if state not in ("approach_ball", "approach_owner"):
         return SCHEMA
-    return {**SCHEMA, "properties": {**SCHEMA["properties"],
-                                    "action": {"type": "string", "enum": list(NAVIGATION_ACTIONS)}}}
+    properties = {**SCHEMA["properties"],
+                  "action": {"type": "string", "enum": list(NAVIGATION_ACTIONS)}}
+    required = list(SCHEMA["required"])
+    if state in ("approach_ball", "approach_owner"):
+        properties = {"target_screen_x": {"type": "number", "minimum": -1, "maximum": 1}, **properties}
+        required.insert(0, "target_screen_x")
+    return {**SCHEMA, "properties": properties, "required": required}
+
+
+TARGET_ALIGNMENT = """First report target_screen_x: the horizontal center of the CURRENT TARGET
+in the CURRENT image, normalized 0 at the left edge, 0.5 at center, 1 at the right edge.
+In approach_ball the target is the RED BALL ON THE GRASS; ignore the person.
+In approach_owner the target is the BLUE PERSON'S TORSO; ignore the carried red ball.
+Report -1 ONLY if that target is not visible. Do not report the dog, shadows, or an
+imagined target position. The image center is the dog's forward axis.
+The middle 20% of the screen (x from 0.40 through 0.60 inclusive) counts as aligned:
+walk FORWARD without turning. If x < 0.40 turn LEFT first; if x > 0.60 turn RIGHT first.
+Reobserve after turning; do not walk until the target is in this center band.
+A wall behind a visible target is not a reason to abandon it. If the obstacle sensor
+is true but movement has NOT collided, approach a centered target in short steps.
+Unity handles pickup/drop once in range. An actual collision permits a large escape turn.
+"""
+
+
+def align_to_target(action):
+    x = action["target_screen_x"]
+    if x == -1:
+        action["action"] = action["action"] if action["action"] in ("turn_left", "turn_right") else "turn_right"
+        action["amount"] = 45
+    elif .4 <= x <= .6:
+        # The middle 20% of the image is aligned, including both boundaries.
+        amount = action["amount"] if action["action"] == "move_forward" else .6
+        action["action"], action["amount"] = "move_forward", min(1.5, max(.1, amount))
+    else:
+        action["action"] = "turn_left" if x < .5 else "turn_right"
+        action["amount"] = round(min(35, max(5, abs(x - .5) * 90)), 1)
+    action["navigation_guard"] = "target_visual_alignment"
+    action["reason"] = f"Target visual alignment (x={x:.3f}). Model: " + action["reason"]
+    return action
 
 
 def validate_action(value):
@@ -196,6 +238,7 @@ class VisionBridge:
         self.provider = provider
         self.api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", "")
         self.sessions = OrderedDict()
+        self.search_directions = {}  # session -> (target state, committed turn)
         self.lock = threading.Lock()
         self.trace_dir = Path(trace_dir) if trace_dir else None
         self.last_model_response = None
@@ -219,8 +262,10 @@ class VisionBridge:
             old = observation.get("supersedes_session")
             if isinstance(old, str):
                 self.sessions.pop(old, None)
+                self.search_directions.pop(old, None)
                 self.fallback_sessions.pop(old, None)
             self.sessions.pop(session, None)
+            self.search_directions.pop(session, None)
             self.fallback_sessions.pop(session, None)
             self.current_state = "planning"
             self.last_model_response = None
@@ -267,11 +312,17 @@ class VisionBridge:
             raise ValueError("Image must be JPEG or PNG")
         with self.lock:
             self.current_state = state
+            search = self.search_directions.get(session)
+            if search is not None and search[0] != state:
+                self.search_directions.pop(session, None)
+                search = None
             previous = self.sessions.get(session, [])
             # Keep only recent actions/results. Refeeding the model's own visual
             # claims made it repeat stale "ball is left" explanations indefinitely.
             history = "\n".join(previous[-8:]) or "No actions yet."
             feedback = str(observation.get("last_result", ""))[:1000]
+            obstacle_ahead = observation.get("obstacle_ahead") is True
+            collided = "blocked by a collision" in feedback.lower()
             holding = bool(observation.get("holding_ball", observation.get("holding_baton", False)))
             returning = holding and bool(re.search(r"\b(fetch|bring|retrieve|deliver|return)\b", command, re.I))
             active_command = ("Find the person in blue, approach them, and drop the ball you are carrying."
@@ -313,9 +364,12 @@ class VisionBridge:
                 # State transitions, not old action sequences, define the next subtask.
                 messages = [
                     {"role": "system", "content": NAVIGATION_SYSTEM + "\nCURRENT STATE: " + state
+                     + ("\n" + TARGET_ALIGNMENT if state in ("approach_ball", "approach_owner") else "")
                      + "\nCURRENT GOAL: " + goal + "\nSchema: " + json.dumps(schema_for_state(state))},
                     {"role": "user", "content": f"Original user request (overall context): {command}\n"
                      f"State: {state}\nCarrying ball: {holding}\nLatest action result: {feedback}\n"
+                     f"Search direction while target is absent: {search[1] if search else 'choose once, then keep it until visible'}\n"
+                     f"Obstacle ahead: {obstacle_ahead}\nRecent actions/results (not visual evidence):\n{chr(10).join(previous[-4:]) or 'none'}\n"
                      f"Current instruction: {goal}\nInspect this screenshot and choose the next action for this state only.",
                      "images": [image]},
                 ]
@@ -352,18 +406,47 @@ class VisionBridge:
                     self.fallback_sessions[session] = {"plan": plan, "fetch": fetch, "cursor": 0, "error": error}
                     print(f"[{session[:8]}] PLACEHOLDER fallback: {error}", flush=True)
                     action = next_action(self.fallback_sessions[session])
+            navigating = state in ("approach_ball", "approach_owner") and action.get("source") == "vlm"
+            escape = navigating and (collided or (obstacle_ahead and action["target_screen_x"] == -1))
+            if navigating and not escape:
+                action = align_to_target(action)
+                if obstacle_ahead and action["action"] == "move_forward":
+                    action["amount"] = min(.3, action["amount"])
+            if escape:
+                # Keep the model's escape direction, but enforce a useful turn.
+                # Explicit user choreography is unaffected by this navigation guard.
+                if action["action"] in ("turn_left", "turn_right"):
+                    action["amount"] = max(60, action["amount"])
+                elif action["action"] in ("move_forward", "wait"):
+                    action["action"], action["amount"] = "turn_right", 90
+                action["navigation_guard"] = "obstacle_escape"
+                action["reason"] = "Obstacle escape guard. Model: " + action["reason"]
+            if navigating:
+                if action["target_screen_x"] == -1:
+                    # Apply AFTER obstacle avoidance so it cannot reverse an ongoing search.
+                    direction = search[1] if search else (action["action"] if action["action"] in ("turn_left", "turn_right") else "turn_right")
+                    self.search_directions[session] = (state, direction)
+                    action["amount"] = max(60 if escape else 45, action["amount"] if action["action"].startswith("turn_") else 0)
+                    action["action"] = direction
+                    action["search_direction"] = direction
+                    action["navigation_guard"] = "persistent_target_search"
+                    action["reason"] = f"Target absent; keep searching {direction}. Model: " + action["reason"]
+                else:
+                    self.search_directions.pop(session, None)
             previous.append("Feedback: " + str(observation.get("last_result", ""))[:1000])
             previous.append("Decision: " + json.dumps({"action": action["action"], "amount": action["amount"]}))
             self.sessions[session] = previous[-160:]
             self.sessions.move_to_end(session)
             if state == "complete":
                 self.sessions.pop(session, None)
+                self.search_directions.pop(session, None)
                 self.fallback_sessions.pop(session, None)
                 if trace is not None:
                     trace["context_cleared"] = True
             self._trace_result(trace, action=action)
             while len(self.sessions) > 32:
                 expired, _ = self.sessions.popitem(last=False)
+                self.search_directions.pop(expired, None)
                 self.fallback_sessions.pop(expired, None)
             print(f"[{session[:8]}] {action['action']} {action['amount']}: {action['reason']}", flush=True)
             return action
@@ -385,6 +468,7 @@ class VisionBridge:
                   "previous_result": observation.get("last_result"),
                   "holding_ball": bool(observation.get("holding_ball", observation.get("holding_baton", False))),
                   "state": self.current_state,
+                  "obstacle_ahead": observation.get("obstacle_ahead") is True,
                   "requested_action": observation.get("requested_action", ""),
                   "provider": self.provider, "model": self.model,
                   "image_file": image_path.relative_to(self.trace_dir).as_posix(),
@@ -416,9 +500,15 @@ class VisionBridge:
 
     def _model_action(self, messages, raw_image, image):
         schema = schema_for_state(self.current_state)
-        action = validate_action(self._model_json(messages, raw_image, image, schema))
+        value = self._model_json(messages, raw_image, image, schema)
+        action = validate_action(value)
         if action["action"] not in schema["properties"]["action"]["enum"]:
             raise ValueError("Model action is not allowed in the current task state")
+        if self.current_state in ("approach_ball", "approach_owner"):
+            x = value.get("target_screen_x")
+            if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or not (x == -1 or 0 <= x <= 1):
+                raise ValueError("Target position must be -1 (absent) or a normalized image coordinate")
+            action["target_screen_x"] = x
         return action
 
     def _model_json(self, messages, raw_image, image, schema, name="dog_action"):
@@ -474,7 +564,7 @@ def make_handler(bridge):
 
         def do_GET(self):
             if self.path == "/health":
-                self.send_json(200, {"status": "ok", "model": bridge.model, "provider": bridge.provider,
+                self.send_json(200, {"status": "ok", "protocol_version": 2, "model": bridge.model, "provider": bridge.provider,
                                      "mode": bridge.mode, "fallback_enabled": bridge.mode != "live",
                                      "key_configured": bool(bridge.api_key) if bridge.provider == "openai" else None,
                                      "note": "Bridge health does not confirm API credits or model availability."})

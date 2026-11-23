@@ -57,6 +57,7 @@
     <Compile Include="Assets\TutorialInfo\Readme.cs" />
     <Compile Include="Assets\GoodBoy\Scripts\GoodBoyGame.cs" />
     <Compile Include="Assets\GoodBoy\Scripts\DogAction.cs" />
+    <Compile Include="Assets\GoodBoy\Scripts\GrasslandEnvironment.cs" />
     <Compile Include="Assets\GoodBoy\Scripts\DogMeshRig.cs" />
   </ItemGroup>
   <ItemGroup>

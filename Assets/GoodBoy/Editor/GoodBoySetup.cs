@@ -178,11 +178,11 @@ public class GoodBoyVerification : MonoBehaviour
         { Fail(9,"Carry attachment drifted: "+maxCarryError); yield break; }
         var controller = dog.GetComponent<CharacterController>();
         controller.enabled = false;
-        dog.position = new Vector3(-3, .02f, -2.3f);
+        dog.position = new Vector3(-3, .02f, -3.9f);
         controller.enabled = true;
         yield return game.Execute(new DogAction { action = "drop" });
         if (game.IsHoldingBall || !game.LastResult.StartsWith("Fetch succeeded"))
-        { Fail(7,"Ball delivery at 2.7m failed."); yield break; }
+        { Fail(7,"Ball delivery at 1.1m failed."); yield break; }
         yield return new WaitForSeconds(.8f);
         if(!ball.IsSettled) { Fail(10,"Dropped ball did not settle");yield break; }
         game.ThrowAt(new Vector3(3,0,3));
@@ -224,7 +224,7 @@ public class GoodBoyVerification : MonoBehaviour
         yield return game.Execute(new DogAction {action="pick_up"});
         yield return null;
         Capture("carry-view",true);
-        string summary="Startup WASD, typing isolation, Enter restoring WASD, movement, turn, 1.8m pickup, 2.7m delivery, stationary landing, carry through walk/turn/dance/sit/stand/roll, render and HTTP loop passed. Max carry error: "+maxCarryError;
+        string summary="Startup WASD, typing isolation, Enter restoring WASD, movement, turn, 1.8m pickup, 1.1m delivery, stationary landing, carry through walk/turn/dance/sit/stand/roll, render and HTTP loop passed. Max carry error: "+maxCarryError;
         Debug.Log("GOODBOY_PLAY_OK: "+summary);
         GoodBoySetup.Complete(0,summary);
     }

@@ -1,0 +1,1 @@
+python Server/server.py --provider ollama --model qwen3-vl:4b-instruct --api-url http://127.0.0.1:11434 --mode live --api-timeout 120

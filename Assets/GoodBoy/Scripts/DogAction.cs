@@ -18,6 +18,7 @@ public class DogObservation
     public string image_base64;
     public string last_result;
     public bool holding_ball;
+    public bool obstacle_ahead;
     public string state = "command";
     public string requested_action = "";
     public float requested_amount = 1;
@@ -44,6 +45,7 @@ public class DogPlan
 [Serializable]
 public class BridgeHealth
 {
+    public int protocol_version;
     public string status;
     public string model;
     public string provider;

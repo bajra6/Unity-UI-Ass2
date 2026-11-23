@@ -14,6 +14,88 @@ from server import VisionBridge, make_handler, validate_action, validate_plan
 
 
 class BridgeTests(unittest.TestCase):
+    def test_search_keeps_first_direction_even_when_model_and_obstacles_reverse(self):
+        for state in ('approach_ball', 'approach_owner'):
+            for first, other in (('turn_left', 'turn_right'), ('turn_right', 'turn_left')):
+                bridge = VisionBridge('test', provider='ollama', mode='live')
+                replies = [{'target_screen_x': -1, 'action': a, 'amount': 10, 'reason': 'test'}
+                           for a in (first, other, 'move_backward', other)]
+                with patch.object(bridge, '_model_action', side_effect=replies):
+                    for i in range(4):
+                        action = bridge.step(self.observation(state=state, obstacle_ahead=i > 0))
+                        self.assertEqual(action['action'], first)
+                        self.assertGreaterEqual(action['amount'], 60 if i > 0 else 45)
+
+    def test_search_unlocks_when_target_visible_or_changes_and_is_session_local(self):
+        bridge = VisionBridge('test', provider='ollama', mode='live')
+        def step(session, state, x, proposed):
+            with patch.object(bridge, '_model_action', return_value={'target_screen_x': x, 'action': proposed, 'amount': 10, 'reason': 'test'}):
+                return bridge.step(self.observation(session_id=session, state=state))['action']
+        self.assertEqual(step('a', 'approach_ball', -1, 'turn_right'), 'turn_right')
+        self.assertEqual(step('b', 'approach_ball', -1, 'turn_left'), 'turn_left')
+        self.assertEqual(step('a', 'approach_ball', .2, 'turn_right'), 'turn_left')
+        self.assertNotIn('a', bridge.search_directions)
+        self.assertEqual(step('a', 'approach_ball', -1, 'turn_left'), 'turn_left')
+        self.assertEqual(step('a', 'approach_owner', -1, 'turn_right'), 'turn_right')
+        bridge.step(self.observation(session_id='a', state='complete'))
+        self.assertNotIn('a', bridge.search_directions)
+
+    def test_new_plan_clears_search_commitment(self):
+        bridge = VisionBridge('test', provider='ollama', mode='live')
+        bridge.search_directions['old'] = ('approach_ball', 'turn_left')
+        bridge.search_directions['fallback-test'] = ('approach_owner', 'turn_right')
+        with patch.object(bridge, '_model_json', return_value={'steps': []}):
+            bridge.plan(self.observation(supersedes_session='old'))
+        self.assertFalse(bridge.search_directions)
+
+    def test_both_targets_use_middle_twenty_percent(self):
+        for state in ('approach_ball', 'approach_owner'):
+            for x, proposed, expected in ((.8, 'move_forward', 'turn_right'),
+                                          (.2, 'turn_right', 'turn_left'),
+                                          (.399, 'move_forward', 'turn_left'),
+                                          (.4, 'turn_left', 'move_forward'),
+                                          (.5, 'turn_right', 'move_forward'),
+                                          (.6, 'turn_right', 'move_forward'),
+                                          (.601, 'move_forward', 'turn_right'),
+                                          (-1, 'move_forward', 'turn_right')):
+                with self.subTest(state=state, x=x):
+                    bridge = VisionBridge('test', provider='ollama', mode='live')
+                    reply = {'target_screen_x': x, 'reason': 'test', 'action': proposed, 'amount': 1.5}
+                    with patch('server.urllib.request.urlopen', return_value=io.StringIO(json.dumps({'message': {'content': json.dumps(reply)}}))):
+                        action = bridge.step(self.observation(state=state, holding_ball=state == 'approach_owner'))
+                    self.assertEqual(action['action'], expected)
+                    self.assertEqual(action['target_screen_x'], x)
+                    if x in (.2, .8): self.assertAlmostEqual(action['amount'], 27)
+
+    def test_target_position_is_required_and_validated(self):
+        for state in ('approach_ball', 'approach_owner'):
+            for x in (None, True, -.5, 1.1, float('nan')):
+                bridge = VisionBridge('test', provider='ollama', mode='live')
+                reply = {'target_screen_x': x, 'reason': 'test', 'action': 'move_forward', 'amount': 1}
+                with patch('server.urllib.request.urlopen', return_value=io.StringIO(json.dumps({'message': {'content': json.dumps(reply)}}))):
+                    with self.assertRaisesRegex(ValueError, 'Target position'):
+                        bridge.step(self.observation(state=state))
+
+    def test_visible_target_near_wall_is_not_abandoned(self):
+        for state in ('approach_ball', 'approach_owner'):
+            for x, expected, amount in ((.5, 'move_forward', .3), (.8, 'turn_right', 27)):
+                bridge = VisionBridge('test', provider='ollama', mode='live')
+                with patch.object(bridge, '_model_action', return_value={'target_screen_x': x, 'action': 'turn_left', 'amount': 90, 'reason': 'Wall nearby'}):
+                    action = bridge.step(self.observation(state=state, obstacle_ahead=True))
+                self.assertEqual((action['action'], action['amount']), (expected, amount))
+
+    def test_actual_collision_or_wall_without_target_uses_escape(self):
+        for state in ('approach_ball', 'approach_owner'):
+            for x, feedback in ((.5, 'Movement blocked by a collision.'), (-1, 'Turn completed.')):
+                bridge = VisionBridge('test', provider='ollama', mode='live')
+                with patch.object(bridge, '_model_action', return_value={'target_screen_x': x, 'action': 'turn_left', 'amount': 10, 'reason': 'test'}):
+                    action = bridge.step(self.observation(state=state, obstacle_ahead=True, last_result=feedback))
+                self.assertEqual((action['action'], action['amount']), ('turn_left', 60))
+        bridge = VisionBridge('test', provider='ollama', mode='live')
+        action = bridge.step(self.observation(state='perform_action', obstacle_ahead=True,
+                                              requested_action='turn_left', requested_amount=10))
+        self.assertEqual(action['amount'], 10)
+
     def test_plan_preserves_order_and_delivery_discards_tail(self):
         plan = validate_plan({'steps': [{'action': a, 'amount': 1} for a in
                                       ('sit', 'stand', 'roll', 'dance', 'get_ball', 'deliver_ball', 'dance')]})
