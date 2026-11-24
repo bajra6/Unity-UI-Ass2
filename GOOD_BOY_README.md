@@ -12,7 +12,7 @@ Open `Assets/Scenes/GoodBoyFetch.unity` and press Play. The grassland and contro
 - Buttons: sit, stand, dance, roll, sniff, pee, pick up, drop.
 - Esc or Stop: cancel the active task.
 - The blue figure is the owner; the golden dog is controlled by the agent.
-- Pick up while facing the red ball within **2 meters** of the dog's center. Drop within **2 meters** of the owner to complete delivery. The HUD shows the distance.
+- Pick up while facing the red ball within **2 meters** of the dog's center. Delivery to a named recipient drops within **2 meters** of that recipient; a direct drop releases the ball here. The HUD shows the distance.
 - The red ball is 52 cm across. It follows an arc when thrown, stops on first floor contact, and stays still until picked up or thrown again.
 - **Server details** shows the last exact JSON response. **Reconnect** checks the Python bridge. Manual buttons are labeled separately from VLM-driven actions.
 
@@ -30,15 +30,15 @@ New instructions first go to `POST /plan` with the screenshot, carrying state, a
 | --- | --- | --- |
 | `approach_ball` | Navigate toward the red ball; ignore the owner | VLM |
 | `pick_up` | Ball is within 2 m and low enough to pick up | Fetch controller; no model call |
-| `approach_owner` | Navigate toward the blue person; ignore the carried ball | VLM |
-| `drop` | Owner is within 2 m; release the ball | Fetch controller; no model call |
-| `complete` | Delivery succeeded; finish | Fetch controller; no model call |
+| `approach_target` | Navigate toward the requested delivery recipient/place; ignore the carried ball | VLM |
+| `drop` | Requested destination reached; release the ball and continue the plan | Task controller; no model call |
+| `complete` | All requested steps succeeded; finish and clear context | Task controller; no model call |
 
 Each request contains the original user command, screenshot, current state, carrying flag, and execution feedback. Each approach prompt gives only that state's navigation goal, with no old visual claims or ball-approach history replayed on the return leg. The VLM can choose only movement, turning, or waiting in approach states; it cannot finish early or pick/drop at the wrong stage. The HUD displays the state and labels automatic interactions as **Fetch controller**.
 
 Both approach states allow 1.0-1.5 meter moves when far and aligned, shortening to 0.3-0.6 meters nearby. Unity checks proximity during movement and stops as soon as the interaction range is reached, avoiding an overshoot followed by more turning. Automatic fetch pickup does not require extra facing adjustment once nearby; manual pickup retains its facing check. Coordinates are used locally for proximity checks and are not sent to the model. The model describes current visual evidence before choosing its action.
 
-Standalone and compound instructions share this planner. `perform_action` executes each planned primitive before advancing. Successful delivery ends the entire task, discards remaining instructions, and clears the command and server history. Thus "fetch then dance" ends at delivery. Screenshot and response logs remain on disk.
+Standalone and compound instructions share this planner. `perform_action` executes each planned primitive before advancing. Success means completing the entire planned instruction. Delivery finishes one step and preserves later actions, so "fetch to the pink guy, then sit" performs pickup, pink delivery, and sitting before success. "Drop it here" succeeds at the current location when carrying. A failed drop does not mark the instruction successful. Command and server history clear only when the whole plan finishes. Screenshot and response logs remain on disk.
 
 During fetch navigation, Unity reports obstacles in the next 1.2 meters. A visible target still follows the centering rule; forward steps shorten to at most 0.3 m near walls. An actual collision, or an obstacle with no visible target, triggers large escape turns (60-90 degrees). Explicit planned movements retain their requested angles. Logs mark escape actions with `navigation_guard: "obstacle_escape"`.
 
@@ -59,7 +59,7 @@ An optional `--provider ollama --model YOUR_VISION_MODEL` mode is also available
 
 For local Qwen3-VL, keep Ollama running and use `python Server/server.py --provider ollama --model qwen3-vl:4b-instruct --api-url http://127.0.0.1:11434 --mode live --api-timeout 120` from the project root. `live` makes model failures visible instead of running the scripted fallback. Restart the Python bridge after changing its code.
 
-If Unity reports `Unknown endpoint` for `/plan`, an older server may still be running on port 8000. Stop that process and start the updated bridge; editing Python files does not reload a running process. `/health` now reports `protocol_version: 3`, and Unity warns when connected to an older bridge.
+If Unity reports `Unknown endpoint` for `/plan`, an older server may still be running on port 8000. Stop that process and start the updated bridge; editing Python files does not reload a running process. `/health` now reports `protocol_version: 4`, and Unity warns when connected to an older bridge.
 
 Try: "Sit." Then "Dance, then find the red ball and bring it back to the person in blue."
 
@@ -92,7 +92,7 @@ The `Good Boy > Create Fetch Scene` menu creates a dedicated scene if absent and
 
 With this project open in Unity, run `python Server/verify_unity.py --project "D:\bajra\IISc\Assignment\IUI\A2\Unity-UI-Ass2" --running-editor` to additionally test both HTTP hops using a local mock vision provider. Add `--placeholder-fallback` to simulate an API outage and verify the fallback sequence. Tests also inject keyboard input to check immediate WASD, typing isolation and Enter restoring movement. They make no paid calls. A passing mock test verifies the integration, **not** the real model's visual navigation ability; evaluate that with a working local or online vision model.
 
-Ball, owner, and described-destination approach use Qwen's `target_screen_x` and `target_screen_y` (x: left=0/right=1; y: top=0/bottom=1; both -1 when absent). The active target is the floor ball before pickup and the blue person's torso afterward. The forward zone is the upper half of the middle 20%: x=0.40?0.60 and y=0?0.50 inclusive. Targets to either side require a turn. A centered target below the midpoint triggers a short 0.25 m backward reposition followed by a new screenshot, not another forward stride or a search turn. Pickup/drop distance and timing are unchanged. No target world position is used for steering; Unity uses distance for pickup/delivery. The outdoor chase camera stays directly behind the dog, including near the fence. Raw visual estimates and adjusted actions remain in the trace logs.
+Ball, owner, and described-destination approach use Qwen's `target_screen_x` and `target_screen_y` (x: left=0/right=1; y: top=0/bottom=1; both -1 when absent). The active target is the ball for pickup, then the recipient or place selected in the instruction for delivery. The forward zone is the upper half of the middle 20%: x=0.40?0.60 and y=0?0.50 inclusive. Targets to either side require a turn. A centered target below the midpoint triggers a short 0.25 m backward reposition followed by a new screenshot, not another forward stride or a search turn. Pickup/drop distance and timing are unchanged. No target world position is used for steering; Unity uses distance for pickup/delivery. The outdoor chase camera stays directly behind the dog, including near the fence. Raw visual estimates and adjusted actions remain in the trace logs.
 
 The environment is a procedural sunny meadow with textured ground, short grass in the fetch clearing, taller grass and trees around its edges, distant hills, and a low wooden boundary fence. `GrasslandEnvironment.cs` generates it without additional asset downloads. Grass is decorative and does not block the ball; trees are outside the fetch clearing.
 
@@ -104,10 +104,10 @@ commands or within a VLM-generated plan. Examples: "Pee here", "Go to the pink g
 "Go to the blue guy, sniff, then pee", or "Pee by the left fence". In this game's planner,
 "assert dominance" means approach the pink-shirt person and pee, unless another target is specified.
 
-The generic `go_to` skill carries a `target` description. Named destinations use `pink_person`,
+The `go_to` and `deliver_ball` skills carry a `target` description. Plain fetch defaults to the blue owner only when no destination is requested; an explicit recipient always takes precedence. Named destinations use `pink_person`,
 `blue_person`, or `red_ball`; other destinations are described visually. The VLM still steers
 from screenshots with the upper-middle alignment rule and persistent search direction. Unity
-stops within 1.2 m of named destinations; other destinations use the model's visual `target_close`
+stops within 1.2 m for go_to or 2 m for delivery to named destinations; other destinations use the model's visual `target_close`
 assessment. Described destinations must be visible/reachable within the fenced area.
 
 Pee is a timed procedural animation: turn sideways, shift weight, raise the right hind leg,
@@ -115,7 +115,7 @@ show a thin gravity-curved stream, lower the leg and return to the starting head
 named destination, local interaction aiming points the stream toward it after navigation.
 Sniff lowers the body and sweeps the head direction. Stop cancels both pose and stream.
 These use the existing prototype mesh rig rather than motion-capture animation. New clients
-require bridge protocol 3; restart your server manually after updating. Tests leave no game
+require bridge protocol 4; restart your server manually after updating. Tests leave no game
 server running.
 
 Paw and toe mesh pieces are bound rigidly to their leg joint, with a smooth lower-leg-to-body weight transition. Unity verification checks that their shape is preserved during the raised-leg pee pose, so they cannot leave stretched triangles attached to the ground.

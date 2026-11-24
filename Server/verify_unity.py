@@ -32,7 +32,7 @@ def main():
             observations.append(len(image))
             if request['text']['format']['name'] == 'dog_plan':
                 names = ['get_ball', 'deliver_ball'] if args.placeholder_fallback else ['dance', 'move_forward', 'turn_right']
-                plan = {'reason': 'Integration test plan', 'steps': [{'action': name, 'amount': 30 if name == 'turn_right' else .6 if name == 'move_forward' else 1} for name in names]}
+                plan = {'reason': 'Integration test plan', 'steps': [{'action': name, 'target': 'blue_person' if name == 'deliver_ball' else '', 'amount': 30 if name == 'turn_right' else .6 if name == 'move_forward' else 1} for name in names]}
                 body = json.dumps({'status': 'completed', 'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(plan)}]}]}).encode()
                 self.send_response(200); self.end_headers(); self.wfile.write(body)
                 return

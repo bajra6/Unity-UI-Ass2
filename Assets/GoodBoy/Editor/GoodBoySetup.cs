@@ -114,7 +114,12 @@ public class GoodBoyVerification : MonoBehaviour
         var camera=Camera.main;
         var pos=camera.transform.position;var rot=camera.transform.rotation;
         if(portrait) { camera.transform.position=new Vector3(3.2f,2.1f,1.8f);camera.transform.LookAt(new Vector3(-.5f,.9f,-2.6f)); }
-        if(name=="dominance-view") { camera.transform.position=new Vector3(7,2.2f,1);camera.transform.LookAt(new Vector3(3.5f,.7f,-2.6f)); }
+        if(name=="dominance-view")
+        {
+            Vector3 pinkPosition = GameObject.Find("Person in pink").transform.position;
+            camera.transform.position=pinkPosition+new Vector3(3,2.2f,4);
+            camera.transform.LookAt(pinkPosition+new Vector3(-.5f,.7f,.4f));
+        }
         var rt=RenderTexture.GetTemporary(1600,900,24);
         var oldTarget=camera.targetTexture;var oldActive=RenderTexture.active;
         camera.targetTexture=rt;camera.Render();RenderTexture.active=rt;
@@ -226,7 +231,7 @@ public class GoodBoyVerification : MonoBehaviour
         dog.position = new Vector3(-3, .02f, -3.9f);
         controller.enabled = true;
         yield return game.Execute(new DogAction { action = "drop" });
-        if (game.IsHoldingBall || !game.LastResult.StartsWith("Fetch succeeded"))
+        if (game.IsHoldingBall || !game.LastResult.StartsWith("Drop completed"))
         { Fail(7,"Ball delivery at 1.1m failed."); yield break; }
         yield return new WaitForSeconds(.8f);
         if(!ball.IsSettled) { Fail(10,"Dropped ball did not settle");yield break; }
@@ -253,7 +258,7 @@ public class GoodBoyVerification : MonoBehaviour
             bool placeholder=SessionState.GetBool("GoodBoyVerifyPlaceholder",false) || Environment.GetEnvironmentVariable("GOODBOY_VERIFY_PLACEHOLDER")=="1";
             game.BeginCommand(placeholder ? "Find the ball" : "Dance, move forward, turn right, then finish.");
             float deadline = Time.realtimeSinceStartup + 35;
-            string finishedPrefix=placeholder ? "Placeholder demo finished" : "Task complete";
+            string finishedPrefix=placeholder ? "Placeholder demo finished" : "Instruction completed successfully";
             while ((game.DecisionCount < 4 || !game.LastResult.StartsWith(finishedPrefix)) && Time.realtimeSinceStartup < deadline) yield return null;
             if (game.DecisionCount != 4 || !game.LastResult.StartsWith(finishedPrefix) || Vector3.Distance(beforeAI,dog.position)<.45f)
             { Fail(8,"Unity HTTP movement/action loop failed: " + game.LastResult); yield break; }
@@ -261,6 +266,42 @@ public class GoodBoyVerification : MonoBehaviour
                 : "GOODBOY_HTTP_OK: camera -> Python -> mock provider -> dance/move/turn/finish; actual movement verified");
             SessionState.EraseString("GoodBoyVerifyUrl");
             SessionState.EraseBool("GoodBoyVerifyPlaceholder");
+        }
+        if (Environment.GetEnvironmentVariable("GOODBOY_VERIFY_INSTRUCTIONS") == "1")
+        {
+            game.serverUrl=Environment.GetEnvironmentVariable("GOODBOY_VERIFY_URL");
+            foreach (string recipient in new[] { "pink", "blue" })
+            {
+                var person = GameObject.Find(recipient == "pink" ? "Person in pink" : "Owner in blue").transform;
+                controller.enabled=false; dog.position=person.position+new Vector3(0,.02f,1.8f); dog.rotation=Quaternion.identity; controller.enabled=true;
+                ball.Place(game.transform,dog.position+dog.forward*.5f+Vector3.up*FetchBall.Radius);
+                game.BeginCommand("Fetch the ball to the " + recipient + " person, then sit.");
+                bool sawDrop=false, sawSit=false;
+                float deadline=Time.realtimeSinceStartup+25;
+                while (Time.realtimeSinceStartup<deadline && !game.InstructionSucceeded)
+                {
+                    if (game.LastResult.StartsWith("Drop completed")) sawDrop=true;
+                    if (game.LastResult.StartsWith("Sit completed")) sawSit=true;
+                    yield return null;
+                }
+                if (!game.InstructionSucceeded || !sawDrop || !sawSit || game.IsHoldingBall || game.DecisionCount!=4)
+                { game.Cancel(); Fail(22,"Instruction did not complete pickup, delivery and sit for " + recipient); yield break; }
+            }
+            controller.enabled=false;dog.position=new Vector3(0,.02f,5);dog.rotation=Quaternion.identity;controller.enabled=true;
+            ball.Place(game.transform,dog.position+dog.forward*.5f+Vector3.up*FetchBall.Radius);
+            yield return game.Execute(new DogAction { action="pick_up" });
+            game.BeginCommand("Drop it here.");
+            float dropDeadline=Time.realtimeSinceStartup+15;
+            while (!game.InstructionSucceeded && Time.realtimeSinceStartup<dropDeadline) yield return null;
+            if (!game.InstructionSucceeded || game.IsHoldingBall || game.DecisionCount!=2)
+            { game.Cancel(); Fail(23,"Drop here failed away from both people."); yield break; }
+            game.BeginCommand("Drop it here."); // Empty-handed: must fail, not claim success.
+            float failureDeadline=Time.realtimeSinceStartup+15;
+            while (!game.LastResult.StartsWith("Drop failed") && Time.realtimeSinceStartup<failureDeadline) yield return null;
+            if (game.InstructionSucceeded || !game.LastResult.StartsWith("Drop failed"))
+            { game.Cancel(); Fail(24,"Failed drop incorrectly completed the instruction."); yield break; }
+            game.Cancel();
+            Debug.Log("GOODBOY_INSTRUCTIONS_OK: pink/blue delivery then sit, drop here, and failed-drop handling");
         }
         if (Environment.GetEnvironmentVariable("GOODBOY_VERIFY_DOMINANCE") == "1")
         {
@@ -272,10 +313,10 @@ public class GoodBoyVerification : MonoBehaviour
             while (Time.realtimeSinceStartup < deadline)
             {
                 if (!sawPee && GameObject.Find("Pee stream")) { sawPee=true; Capture("dominance-view"); }
-                if (game.LastResult=="Task complete.") break;
+                if (game.LastResult=="Instruction completed successfully.") break;
                 yield return null;
             }
-            if (!sawPee || game.LastResult!="Task complete." || Vector3.Distance(dog.position,pinkPerson.transform.position)>1.25f)
+            if (!sawPee || game.LastResult!="Instruction completed successfully." || Vector3.Distance(dog.position,pinkPerson.transform.position)>1.25f)
             { game.Cancel(); Fail(19,"Dominance flow failed to approach pink person and finish pee."); yield break; }
             Debug.Log("GOODBOY_DOMINANCE_OK: real VLM plan -> approach pink person -> pee -> finish");
         }

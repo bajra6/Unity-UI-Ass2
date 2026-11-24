@@ -101,17 +101,22 @@ PLAN_SCHEMA = {
 PLAN_SYSTEM = """Interpret the user's instruction into an ordered plan for a dog simulator.
 Use the screenshot, carrying state and remaining plan to understand the situation.
 Available skills: get_ball (navigate to and pick up the red ball), deliver_ball
-(navigate to the blue owner with the carried ball and drop it), sit, stand, dance,
+(navigate to the requested destination with the carried ball and drop it), sit, stand, dance,
 roll, pee (raise a hind leg and urinate here), sniff (sniff the ground here),
 go_to (approach a described destination), move_forward, move_backward, turn_left, turn_right, wait, drop.
-Every step has a target string: use an empty string except for go_to.
-For go_to use pink_person for the pink-shirt person, blue_person for the blue owner,
+Every step has a target string: use an empty string except for go_to and deliver_ball.
+For go_to and deliver_ball use pink_person for the pink-shirt person, blue_person for the blue owner,
 red_ball for the ball, or a brief visual description such as "nearest tree" or "left fence".
 For an action at a named place, plan go_to(target) then that action. "Pee here" needs only pee.
 In this game, "assert dominance" means go_to(pink_person), pee, unless the user specifies another target.
 Pee and sniff may be requested anywhere and at any stage; do not fetch unless requested.
 Do not replace go_to with guessed movement commands. Each approach uses fresh screenshots.
-A FETCH means BOTH pickup AND return: get_ball then deliver_ball. If already carrying, use deliver_ball only.
+A FETCH means pickup AND delivery: get_ball then deliver_ball(target). If already carrying, use deliver_ball only.
+Use the USER'S requested recipient or place as the delivery target. Only when no destination
+is specified does a plain fetch default to blue_person. Never substitute blue_person for pink_person.
+"Fetch the ball for the pink guy" means get_ball, deliver_ball(target="pink_person").
+"Drop it here" means drop at the current location. If not carrying and asked to bring/drop the
+ball at a destination, get_ball first. deliver_ball must always have a nonempty target.
 get_ball is pickup only. deliver_ball is the COMPLETE return trip, not a single movement.
 Do not substitute move_forward for deliver_ball, including when the user says "continue bringing it back".
 Navigation is built into these two skills. NEVER insert move/turn steps around them unless
@@ -122,9 +127,10 @@ Repeated actions should be separate steps. Maximum 32 steps.
 New instructions can interrupt an existing task. If asked to resume/continue, preserve the
 unfinished relevant steps after the new action. If asked to stop, replace, or forget the
 task, discard those steps. Use the meaning of the new instruction; do not blindly append.
-Successful delivery ENDS THE ENTIRE TASK and clears context. Discard any steps after
-deliver_ball, even if requested. A future task will require a new instruction.
-For example, "fetch then do an animation" ends with get_ball, deliver_ball; no animation follows.
+Success means completing ALL requested steps in order, not dropping at a particular person.
+Delivery completes only that step. Preserve all requested actions after delivery.
+For example, "fetch to the pink guy then sit" is get_ball, deliver_ball(pink_person), sit.
+Context clears only when the whole instruction is complete.
 "Do an animation then continue returning" while carrying means that animation, deliver_ball.
 Use amount=1 for get_ball/deliver_ball/animations/drop. Movement amount is meters
 (0.1-1.5); turns are degrees (5-90); waits are seconds (0.1-2). Split longer requests.
@@ -140,18 +146,16 @@ def validate_plan(value):
     for step in value["steps"]:
         if not isinstance(step, dict) or step.get("action") not in PLAN_ACTIONS:
             raise ValueError("Plan contains an unsupported skill")
-        if step["action"] == "go_to":
+        if step["action"] in ("go_to", "deliver_ball"):
             target = step.get("target")
             if not isinstance(target, str) or not target.strip() or len(target) > 160:
-                raise ValueError("go_to requires a visual target description of at most 160 characters")
-            steps.append({"action": "go_to", "amount": 1, "target": target.strip()})
-        elif step["action"] in ("get_ball", "deliver_ball"):
+                raise ValueError(step["action"] + " requires a visual target description of at most 160 characters")
+            steps.append({"action": step["action"], "amount": 1, "target": target.strip()})
+        elif step["action"] == "get_ball":
             steps.append({"action": step["action"], "amount": 1})
         else:
             action = validate_action(step)
             steps.append({"action": action["action"], "amount": action["amount"]})
-        if step["action"] == "deliver_ball":
-            break  # Delivery always terminates the task, including queued instructions.
     return {"reason": str(value.get("reason", ""))[:500], "steps": steps, "source": "vlm"}
 STATE_GOALS = {
     "approach_target": "Approach the requested destination, then perform the next planned action.",
@@ -159,8 +163,8 @@ STATE_GOALS = {
     "approach_ball": "Approach the RED BALL on the grass. Ignore the person for now.",
     "pick_up": "The ball is within pickup range. Pick it up now; do not move or turn.",
     "approach_owner": "Approach the PERSON IN BLUE. The ball is already in your mouth; ignore it for navigation.",
-    "drop": "The owner is within delivery range. Drop the ball now; do not move or turn.",
-    "complete": "The ball was successfully delivered. Finish the fetch task.",
+    "drop": "The requested destination has been reached. Drop the carried ball now; do not move or turn.",
+    "complete": "All requested plan steps are complete. Mark the instruction successful and clear its context.",
 }
 NAVIGATION_SYSTEM = """You guide the golden dog using the CURRENT chase-camera image.
 Unity owns the fetch task state. Follow ONLY the current state's goal, not later goals.
@@ -395,8 +399,6 @@ class VisionBridge:
                         if state == "perform_action" else STATE_GOALS[state])
                 if state == "approach_target":
                     goal = "Approach ONLY this destination: " + target + ". Get close before performing the next action."
-                if state == "complete" and not feedback.startswith("Fetch succeeded"):
-                    goal = "All planned actions are complete. Finish the task and clear its context."
                 # State transitions, not old action sequences, define the next subtask.
                 messages = [
                     {"role": "system", "content": NAVIGATION_SYSTEM + "\nCURRENT STATE: " + state
@@ -614,7 +616,7 @@ def make_handler(bridge):
 
         def do_GET(self):
             if self.path == "/health":
-                self.send_json(200, {"status": "ok", "protocol_version": 3, "model": bridge.model, "provider": bridge.provider,
+                self.send_json(200, {"status": "ok", "protocol_version": 4, "model": bridge.model, "provider": bridge.provider,
                                      "mode": bridge.mode, "fallback_enabled": bridge.mode != "live",
                                      "key_configured": bool(bridge.api_key) if bridge.provider == "openai" else None,
                                      "note": "Bridge health does not confirm API credits or model availability."})

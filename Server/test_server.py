@@ -14,6 +14,24 @@ from server import VisionBridge, make_handler, validate_action, validate_plan
 
 
 class BridgeTests(unittest.TestCase):
+    def test_delivery_requires_destination_and_keeps_later_steps(self):
+        for destination in ('blue_person', 'pink_person', 'left fence'):
+            result = validate_plan({'steps': [{'action': 'deliver_ball', 'target': destination}, {'action': 'sit'}]})
+            self.assertEqual(result['steps'][0]['target'], destination)
+            self.assertEqual(result['steps'][1]['action'], 'sit')
+        with self.assertRaises(ValueError): validate_plan({'steps': [{'action': 'deliver_ball'}]})
+
+    def test_drop_does_not_clear_context_until_full_instruction_finishes(self):
+        bridge = VisionBridge('test', provider='ollama', mode='live')
+        bridge.step(self.observation(state='drop', requested_target='pink_person', holding_ball=True))
+        self.assertIn('fallback-test', bridge.sessions)
+        action = bridge.step(self.observation(state='perform_action', requested_action='sit',
+                                             last_result='Drop completed at pink_person.'))
+        self.assertEqual(action['action'], 'sit')
+        self.assertIn('fallback-test', bridge.sessions)
+        bridge.step(self.observation(state='complete', last_result='Sit completed.'))
+        self.assertNotIn('fallback-test', bridge.sessions)
+
     def test_forward_zone_is_upper_half_and_low_targets_reposition(self):
         for state in ('approach_ball', 'approach_owner', 'approach_target'):
             for y, expected in ((0, 'move_forward'), (.5, 'move_forward'), (.501, 'move_backward'), (1, 'move_backward')):
@@ -144,19 +162,20 @@ class BridgeTests(unittest.TestCase):
                                               requested_action='turn_left', requested_amount=10))
         self.assertEqual(action['amount'], 10)
 
-    def test_plan_preserves_order_and_delivery_discards_tail(self):
-        plan = validate_plan({'steps': [{'action': a, 'amount': 1} for a in
+    def test_plan_preserves_order_including_actions_after_delivery(self):
+        plan = validate_plan({'steps': [{'action': a, 'amount': 1, 'target': 'pink_person' if a == 'deliver_ball' else ''} for a in
                                       ('sit', 'stand', 'roll', 'dance', 'get_ball', 'deliver_ball', 'dance')]})
-        self.assertEqual([s['action'] for s in plan['steps']], ['sit','stand','roll','dance','get_ball','deliver_ball'])
+        self.assertEqual([s['action'] for s in plan['steps']], ['sit','stand','roll','dance','get_ball','deliver_ball','dance'])
+        self.assertEqual(plan['steps'][5]['target'], 'pink_person')
         with self.assertRaises(ValueError):
             validate_plan({'steps': [{'action': 'teleport', 'amount': 1}]})
 
     def test_planner_receives_remaining_plan_and_replaces_old_context(self):
         bridge = VisionBridge('test', provider='ollama', mode='live')
         bridge.sessions['old'] = ['Old conversation']
-        with patch.object(bridge, '_model_json', return_value={'steps': [{'action': 'sit', 'amount': 1}, {'action': 'deliver_ball', 'amount': 1}]}) as model:
+        with patch.object(bridge, '_model_json', return_value={'steps': [{'action': 'sit', 'amount': 1}, {'action': 'deliver_ball', 'amount': 1, 'target': 'blue_person'}]}) as model:
             plan = bridge.plan(self.observation(command='Sit, then continue returning.', holding_ball=True,
-                               remaining_plan=[{'action': 'deliver_ball', 'amount': 1}], supersedes_session='old'))
+                               remaining_plan=[{'action': 'deliver_ball', 'amount': 1, 'target': 'blue_person'}], supersedes_session='old'))
         self.assertNotIn('old', bridge.sessions)
         self.assertIn('deliver_ball', model.call_args.args[0][1]['content'])
         self.assertEqual(plan['steps'][0]['action'], 'sit')
